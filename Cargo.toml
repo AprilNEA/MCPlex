@@ -1,0 +1,43 @@
+[package]
+name = "mcplex"
+version = "0.4.0"
+edition = "2024"
+description = "A local MCP multiplexer"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AprilNEA/mcplex"
+homepage = "https://github.com/AprilNEA/mcplex"
+rust-version = "1.88"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "=0.29.0"
+directories = "6.0"
+rmcp = { version = "=3.1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+http = "1"
+keyring = { version = "3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust", "apple-native", "vendored"] }
+fs2 = "0.4"
+notify = "8"
+rand = "0.9"
+ratatui = "=0.30.2"
+rpassword = "7.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[workspace.metadata.dist]
+cargo-dist-version = "0.30.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]

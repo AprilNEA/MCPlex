@@ -1,0 +1,10 @@
+[Unit]
+Description=mcplex local MCP multiplexer
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/mcplex serve --foreground
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
