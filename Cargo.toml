@@ -4,8 +4,8 @@ version = "0.4.0"
 edition = "2024"
 description = "A local MCP multiplexer"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/AprilNEA/mcplex"
-homepage = "https://github.com/AprilNEA/mcplex"
+repository = "https://github.com/AprilNEA/MCPlex"
+homepage = "https://github.com/AprilNEA/MCPlex"
 rust-version = "1.88"
 
 [dependencies]
