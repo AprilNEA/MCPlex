@@ -2,6 +2,11 @@ name: Release PR
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional existing release-PR tag to publish or recover (for example v0.4.0).
+        required: false
+        type: string
   push:
     branches: [master]
 
@@ -16,6 +21,7 @@ env:
 jobs:
   release-pr:
     name: release-plz PR
+    if: ${{ github.event_name == 'push' || inputs.release_tag == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -51,8 +57,8 @@ jobs:
   release:
     name: publish crate and create tag
     if: >-
-      github.event_name == 'push' &&
-      startsWith(github.event.head_commit.message, 'chore: release')
+      (github.event_name == 'push' && contains(github.event.head_commit.message, 'chore: release v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -69,36 +75,58 @@ jobs:
       # preserves the same SHA; a later master workflow cannot publish it.
       - name: Validate release commit
         shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mcplex") | .version')"
-          tag="v${version}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${REQUESTED_TAG}"
+            if [[ ! "${tag}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::Invalid recovery tag: ${tag}"
+              exit 1
+            fi
+            version="${tag#v}"
+            release_sha="$(git log -1 --format=%H --fixed-strings --grep="chore: release ${tag}" origin/master || true)"
+            if [[ -z "${release_sha}" ]]; then
+              echo "::error::Could not find a merged release commit for ${tag}"
+              exit 1
+            fi
+          else
+            version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mcplex") | .version')"
+            tag="v${version}"
+            release_sha="${GITHUB_SHA}"
+          fi
+          if ! git merge-base --is-ancestor "${release_sha}" origin/master; then
+            echo "::error::Release commit ${release_sha} is not on origin/master"
+            exit 1
+          fi
+          message="$(git show -s --format=%B "${release_sha}")"
+          normalized_message="$(sed -E 's/ \(#[0-9]+\)$//' <<< "${message}")"
+          if ! grep -Fxq "chore: release ${tag}" <<< "${normalized_message}"; then
+            echo "::error::${release_sha} does not contain an exact release line for ${tag}"
+            exit 1
+          fi
           git fetch --force origin 'refs/tags/*:refs/tags/*'
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
             tag_sha="$(git rev-list -n1 "${tag}")"
-            if [[ "${tag_sha}" != "${GITHUB_SHA}" ]]; then
-              echo "::error::Existing ${tag} points to ${tag_sha}, not release commit ${GITHUB_SHA}"
+            if [[ "${tag_sha}" != "${release_sha}" ]]; then
+              echo "::error::Existing ${tag} points to ${tag_sha}, not release commit ${release_sha}"
               exit 1
             fi
             echo "Tag ${tag} already exists at the release commit; nothing to publish."
             echo "skip=true" >> "$GITHUB_ENV"
             exit 0
           fi
-          subject="$(git show -s --format=%s "${GITHUB_SHA}")"
-          if [[ ! "${subject}" =~ ^chore:\ release ]]; then
-            echo "::error::${GITHUB_SHA} is not a release commit: ${subject}"
-            exit 1
-          fi
-          actual_version="$(git show "${GITHUB_SHA}:Cargo.toml" | sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' | head -n1)"
+          actual_version="$(git show "${release_sha}:Cargo.toml" | sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' | head -n1)"
           if [[ "${actual_version}" != "${version}" ]]; then
             echo "::error::Release commit contains ${actual_version}, expected ${version}"
             exit 1
           fi
-          git switch --force -C master "${GITHUB_SHA}"
+          git switch --force -C master "${release_sha}"
           git branch --set-upstream-to=origin/master master
           echo "skip=false" >> "$GITHUB_ENV"
           echo "release_tag=${tag}" >> "$GITHUB_ENV"
-          echo "release_sha=${GITHUB_SHA}" >> "$GITHUB_ENV"
+          echo "release_sha=${release_sha}" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
         if: env.skip != 'true'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2

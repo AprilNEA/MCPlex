@@ -34,4 +34,7 @@ Do not create the GitHub Release from release-plz: cargo-dist is its sole owner.
 On a failed publish, rerun the original release workflow run, which remains pinned
 to its release commit. If crates.io publication succeeds but tag creation fails,
 first verify that the exact version exists on crates.io, then recover the missing
-tag at that release commit using the GitHub App token so cargo-dist is triggered.
+tag by manually running the Release PR workflow with `release_tag` set to the
+missing `vX.Y.Z`. The recovery validates the exact release line, version, and
+merged `master` ancestry before using the GitHub App token, so cargo-dist is
+triggered from the original release commit.
