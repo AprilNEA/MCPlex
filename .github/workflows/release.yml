@@ -43,6 +43,12 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing vX.Y.Z tag whose cargo-dist release needs recovery
+        required: true
+        type: string
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -50,9 +56,10 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || (!github.event.pull_request && github.ref_name || '') }}
+      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
+      commit: ${{ steps.release.outputs.commit }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -60,6 +67,35 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
+          fetch-depth: 0
+      - id: release
+        name: Validate release recovery
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event_name }}" != workflow_dispatch ]]; then
+            exit 0
+          fi
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "release_tag must be a strict vX.Y.Z tag" >&2
+            exit 1
+          fi
+          version="${RELEASE_TAG#v}"
+          package_version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "mcplex") | .version')"
+          test "$package_version" = "$version"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$commit"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "GitHub Release $RELEASE_TAG already exists" >&2
+            exit 1
+          fi
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -76,8 +112,10 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist ${{ !github.event.pull_request && 'host --steps=create' || 'plan' }} ${{ !github.event.pull_request && '--tag' || '' }} ${{ !github.event.pull_request && '"$RELEASE_TAG"' || '' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -107,7 +145,8 @@ jobs:
       # - 1 "global" task that builds universal installers
       # - N "local" tasks that build each platform's binaries and platform-specific installers
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
-    runs-on: ${{ matrix.runner }}
+    # Keep recovery runs for tags created before the macos-13 retirement runnable.
+    runs-on: ${{ matrix.runner == 'macos-13' && 'macos-14' || matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -120,6 +159,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
       - name: Install Rust non-interactively if not already installed
         if: ${{ matrix.container }}
         run: |
@@ -179,6 +219,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
       - name: Install cached dist
         uses: actions/download-artifact@v4
         with:
@@ -229,6 +270,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
       - name: Install cached dist
         uses: actions/download-artifact@v4
         with:
@@ -271,7 +313,7 @@ jobs:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
-          RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_COMMIT: "${{ needs.plan.outputs.commit }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
@@ -294,6 +336,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
 
   custom-homebrew:
     needs:

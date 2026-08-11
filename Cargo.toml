@@ -52,6 +52,8 @@ lto = "thin"
 cargo-dist-version = "0.30.0"
 # CI backends to support
 ci = "github"
+# release.yml adds a guarded workflow-dispatch recovery path around generated jobs.
+allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
@@ -62,3 +64,8 @@ post-announce-jobs = ["./homebrew"]
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+
+# GitHub retired the macos-13 hosted runner used by cargo-dist's defaults.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-apple-darwin = "macos-14"
+x86_64-apple-darwin = "macos-14"

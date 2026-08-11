@@ -38,3 +38,12 @@ tag by manually running the Release PR workflow with `release_tag` set to the
 missing `vX.Y.Z`. The recovery validates the exact release line, version, and
 merged `master` ancestry before using the GitHub App token, so cargo-dist is
 triggered from the original release commit.
+
+If a tag exists but cargo-dist cannot complete because its original runner image
+was retired, first update `github-custom-runners` and the Release workflow on
+`master`. The workflow is intentionally excluded from cargo-dist freshness
+checks with `allow-dirty = ["ci"]` because it adds this guarded recovery path to
+the generated jobs. Then cancel the permanently queued run and manually run the
+Release workflow with its existing `release_tag`. The recovery checks out and
+validates that tag, refuses to overwrite an existing GitHub Release, and keeps
+the Release target pinned to the tagged commit.
