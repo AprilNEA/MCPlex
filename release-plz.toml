@@ -1,0 +1,14 @@
+[workspace]
+pr_branch_prefix = "release-plz/"
+semver_check = false
+changelog_config = "cliff.toml"
+release_always = false
+git_release_enable = false
+max_analyze_commits = 0
+
+[[package]]
+name = "mcplex"
+publish = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = false

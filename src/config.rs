@@ -70,13 +70,30 @@ const fn enabled_by_default() -> bool {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let source = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        Self::parse(&source).with_context(|| format!("invalid config at {}", path.display()))
+        let config = config_rs::Config::builder()
+            .add_source(
+                config_rs::File::from(path)
+                    .format(config_rs::FileFormat::Toml)
+                    .required(true),
+            )
+            .build()
+            .with_context(|| format!("failed to load config at {}", path.display()))?
+            .try_deserialize::<Self>()
+            .with_context(|| format!("invalid config at {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn parse(source: &str) -> Result<Self> {
-        let config: Self = toml::from_str(source).context("invalid TOML")?;
+        let config = config_rs::Config::builder()
+            .add_source(config_rs::File::from_str(
+                source,
+                config_rs::FileFormat::Toml,
+            ))
+            .build()
+            .context("invalid TOML")?
+            .try_deserialize::<Self>()
+            .context("invalid config")?;
         config.validate()?;
         Ok(config)
     }
@@ -102,10 +119,12 @@ impl Config {
                 TransportConfig::Stdio { command, .. } if command.trim().is_empty() => {
                     bail!("server '{id}' has an empty command")
                 }
-                TransportConfig::Http { url, .. }
-                    if !(url.starts_with("http://") || url.starts_with("https://")) =>
-                {
-                    bail!("server '{id}' URL must use http or https")
+                TransportConfig::Http { url, .. } => {
+                    let parsed = url::Url::parse(url)
+                        .with_context(|| format!("server '{id}' has an invalid URL"))?;
+                    if !matches!(parsed.scheme(), "http" | "https") || !parsed.has_host() {
+                        bail!("server '{id}' URL must be an absolute http or https URL")
+                    }
                 }
                 _ => {}
             }
@@ -114,7 +133,7 @@ impl Config {
     }
 }
 
-/// Durably replace a configuration file without exposing a partially-written file.
+/// Atomically replace a configuration file without exposing a partially-written file.
 pub fn persist_atomic(path: &Path, config: &Config) -> Result<()> {
     let parent = path
         .parent()
@@ -122,39 +141,23 @@ pub fn persist_atomic(path: &Path, config: &Config) -> Result<()> {
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let contents = toml::to_string_pretty(config)?;
-    let mut random = [0_u8; 16];
-    use rand::RngCore as _;
-    rand::rng().fill_bytes(&mut random);
-    let tmp = parent.join(format!(
-        ".mcplex-{}.tmp",
-        random
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    ));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    let mut temp = tempfile::Builder::new()
+        .prefix(".mcplex-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create temporary config in {}", parent.display()))?;
+    temp.write_all(contents.as_bytes())?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    let mut file = options.open(&tmp)?;
-    let result = (|| -> Result<()> {
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace config at {}", path.display()))
 }
 
 /// Serialize a read-modify-write transaction with all mcplex processes.
@@ -256,6 +259,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_fields_after_config_rs_extraction() {
+        let error = Config::parse("[daemon]\nunknown = true").unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field"));
+    }
+
+    #[test]
+    fn validates_http_urls_with_url_parser() {
+        for url in [
+            "https://example.com/mcp",
+            "HTTP://localhost:8080/mcp?client=mcplex",
+            "http://[::1]:8080/mcp",
+        ] {
+            let source = format!(
+                "[servers.remote]\ntransport='http'\nurl={}\n",
+                toml::Value::String(url.into())
+            );
+            Config::parse(&source).unwrap();
+        }
+        for url in [
+            "http://",
+            "http://[::1",
+            "http://localhost:99999",
+            "/relative/mcp",
+            "ftp://example.com/mcp",
+        ] {
+            let source = format!(
+                "[servers.remote]\ntransport='http'\nurl={}\n",
+                toml::Value::String(url.into())
+            );
+            assert!(
+                Config::parse(&source).is_err(),
+                "accepted invalid URL {url}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_effective_prefixes() {
         let error = Config::parse("[servers.a]\ntransport='stdio'\ncommand='x'\nalias='shared'\n[servers.b]\ntransport='stdio'\ncommand='x'\nalias='shared'").unwrap_err();
         assert!(error.to_string().contains("duplicate effective"));
@@ -265,18 +305,22 @@ mod tests {
     #[test]
     fn persistence_is_private() {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("mcplex-config-test-{}", std::process::id()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         persist_atomic(&path, &Config::default()).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), Config::default());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn locked_updates_reload_the_latest_config() {
-        let path = std::env::temp_dir().join(format!("mcplex-update-test-{}", std::process::id()));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config-without-extension");
         update_atomic(&path, |c| {
             c.daemon.port = 45851;
             Ok(())
@@ -290,7 +334,41 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.daemon.port, 45851);
         assert_eq!(config.daemon.bind.to_string(), "127.0.0.2");
-        fs::remove_file(&path).unwrap();
-        let _ = fs::remove_file(path.with_extension("toml.lock"));
+    }
+
+    #[test]
+    fn failed_update_preserves_config_and_releases_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        persist_atomic(&path, &Config::default()).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let result = update_atomic(&path, |config| -> Result<()> {
+            config.daemon.port = 1234;
+            bail!("rejected update")
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        update_atomic(&path, |config| {
+            config.daemon.port = 45851;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(Config::load(&path).unwrap().daemon.port, 45851);
+    }
+
+    #[test]
+    fn failed_persist_cleans_up_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+
+        assert!(persist_atomic(&destination, &Config::default()).is_err());
+        let entries = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [destination.file_name().unwrap()]);
     }
 }

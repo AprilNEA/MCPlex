@@ -104,6 +104,7 @@ and sampling/roots passthrough. See [SECURITY.md](SECURITY.md) and optional, non
 
 ## Development and release
 
-CI runs formatting, clippy, and tests on Linux and macOS. `[workspace.metadata.dist]` and
-the cargo-dist-generated tag-triggered workflow release artifacts, but this repository does
+CI runs formatting, clippy, and tests on Linux and macOS. Release PRs, crates.io
+publication, cargo-dist artifacts, GitHub Releases, and the Homebrew tap update are
+automated as described in [docs/releasing.md](docs/releasing.md). This repository does
 not claim Windows support. Licensed MIT OR Apache-2.0.

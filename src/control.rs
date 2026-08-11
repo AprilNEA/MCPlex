@@ -94,17 +94,18 @@ impl ControlClient {
         self.request(Method::GET, "tools").await
     }
     pub async fn logs(&self, after: Option<u64>, server: Option<&str>) -> Result<LogsResponse> {
-        let mut query = Vec::new();
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
         if let Some(id) = after {
-            query.push(format!("after={id}"));
+            query.append_pair("after", &id.to_string());
         }
         if let Some(server) = server {
-            query.push(format!("server={}", url_encode(server)));
+            query.append_pair("server", server);
         }
+        let query = query.finish();
         let suffix = if query.is_empty() {
             String::new()
         } else {
-            format!("?{}", query.join("&"))
+            format!("?{query}")
         };
         self.request(Method::GET, &format!("logs{suffix}")).await
     }
@@ -128,18 +129,6 @@ impl ControlClient {
 
 fn endpoint_for(address: std::net::SocketAddr) -> String {
     format!("http://{address}/api/v1")
-}
-fn url_encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

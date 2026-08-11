@@ -38,7 +38,7 @@ pub fn control_token() -> Result<String> {
         Ok(_) | Err(keyring::Error::NoEntry) => {
             let mut bytes = [0_u8; 32];
             rand::rng().fill_bytes(&mut bytes);
-            let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let token = hex::encode(bytes);
             entry
                 .set_password(&token)
                 .context("could not store control token")?;

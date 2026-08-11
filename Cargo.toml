@@ -12,32 +12,53 @@ rust-version = "1.88"
 anyhow = "1.0"
 axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
+config-rs = { package = "config", version = "0.15.25", default-features = false, features = ["toml"] }
 crossterm = "=0.29.0"
 directories = "6.0"
 rmcp = { version = "=3.1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 http = "1"
 keyring = { version = "3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust", "apple-native", "vendored"] }
 fs2 = "0.4"
+hex = "0.4"
 notify = "8"
+percent-encoding = "2.3"
 rand = "0.9"
 ratatui = "=0.30.2"
 rpassword = "7.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tempfile = "3"
 tokio = { version = "1.47", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
-toml = "0.9"
+toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
+url = "2"
 
 [profile.release]
 lto = "thin"
 strip = true
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Config for 'dist'
 [workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.30.0"
+# CI backends to support
 ci = "github"
+# The installers to generate for each app
 installers = ["shell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Post-announce jobs to run in CI
+post-announce-jobs = ["./homebrew"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false

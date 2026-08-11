@@ -1,0 +1,51 @@
+name: Dispatch Homebrew update
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: cargo-dist manifest JSON.
+        required: true
+        type: string
+    secrets:
+      OP_SERVICE_ACCOUNT_TOKEN:
+        required: true
+      OP_GITHUB_APP_ITEM:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: dispatch formula update
+    if: ${{ !fromJSON(inputs.plan).announcement_is_prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ fromJSON(inputs.plan).announcement_tag }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Invalid stable release tag: ${RELEASE_TAG}"
+            exit 1
+          fi
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_ENV"
+      - name: Mint homebrew-tap token
+        id: tap-token
+        uses: ./.github/actions/github-app-token-from-1password
+        with:
+          op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          op-github-app-item: ${{ secrets.OP_GITHUB_APP_ITEM }}
+          owner: AprilNEA
+          repositories: homebrew-tap
+      - name: Dispatch formula update
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4
+        with:
+          token: ${{ steps.tap-token.outputs.token }}
+          repository: AprilNEA/homebrew-tap
+          event-type: update-mcplex
+          client-payload: '{"version":"${{ env.release_tag }}"}'

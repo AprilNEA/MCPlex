@@ -1,0 +1,133 @@
+name: Release PR
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  release-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: false
+      # An App token is required: tags created with GITHUB_TOKEN do not trigger
+      # the cargo-dist release workflow.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: ./.github/actions/github-app-token-from-1password
+        with:
+          op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          op-github-app-item: ${{ secrets.OP_GITHUB_APP_ITEM }}
+      - name: Open or update release PR
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
+        with:
+          command: release-pr
+          version: "0.3.160"
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  release:
+    name: publish crate and create tag
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.event.head_commit.message, 'chore: release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    concurrency:
+      group: release-plz-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Pin publication to the release-PR merge event SHA. A retry of this run
+      # preserves the same SHA; a later master workflow cannot publish it.
+      - name: Validate release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mcplex") | .version')"
+          tag="v${version}"
+          git fetch --force origin 'refs/tags/*:refs/tags/*'
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            tag_sha="$(git rev-list -n1 "${tag}")"
+            if [[ "${tag_sha}" != "${GITHUB_SHA}" ]]; then
+              echo "::error::Existing ${tag} points to ${tag_sha}, not release commit ${GITHUB_SHA}"
+              exit 1
+            fi
+            echo "Tag ${tag} already exists at the release commit; nothing to publish."
+            echo "skip=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          subject="$(git show -s --format=%s "${GITHUB_SHA}")"
+          if [[ ! "${subject}" =~ ^chore:\ release ]]; then
+            echo "::error::${GITHUB_SHA} is not a release commit: ${subject}"
+            exit 1
+          fi
+          actual_version="$(git show "${GITHUB_SHA}:Cargo.toml" | sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' | head -n1)"
+          if [[ "${actual_version}" != "${version}" ]]; then
+            echo "::error::Release commit contains ${actual_version}, expected ${version}"
+            exit 1
+          fi
+          git switch --force -C master "${GITHUB_SHA}"
+          git branch --set-upstream-to=origin/master master
+          echo "skip=false" >> "$GITHUB_ENV"
+          echo "release_tag=${tag}" >> "$GITHUB_ENV"
+          echo "release_sha=${GITHUB_SHA}" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b # 1.88.0
+        if: env.skip != 'true'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: env.skip != 'true'
+        with:
+          save-if: false
+      - name: Mint GitHub App token
+        if: env.skip != 'true'
+        id: app-token
+        uses: ./.github/actions/github-app-token-from-1password
+        with:
+          op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          op-github-app-item: ${{ secrets.OP_GITHUB_APP_ITEM }}
+      - name: Publish crate and create tag
+        if: env.skip != 'true'
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
+        with:
+          command: release
+          version: "0.3.160"
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.app-token.outputs.cargo-registry-token }}
+      - name: Verify release tag
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${release_tag}:refs/tags/${release_tag}"
+          tag_sha="$(git rev-list -n1 "${release_tag}")"
+          if [[ "${tag_sha}" != "${release_sha}" ]]; then
+            echo "::error::${release_tag} points to ${tag_sha}, expected ${release_sha}"
+            exit 1
+          fi

@@ -677,16 +677,13 @@ fn validate_route_keys<'a>(kind: &str, keys: impl IntoIterator<Item = &'a str>) 
     Ok(())
 }
 
-fn percent(s: &str) -> String {
-    s.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
+fn percent(value: &str) -> String {
+    const URI_COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(value, URI_COMPONENT).to_string()
 }
 fn redact(s: &str) -> String {
     let mut output = Vec::new();
@@ -753,5 +750,12 @@ mod tests {
         assert!(validate_route_keys("tool", ["a__one", "b__one"]).is_ok());
         let error = validate_route_keys("tool", ["same", "same"]).unwrap_err();
         assert_eq!(error.to_string(), "duplicate public tool route 'same'");
+    }
+    #[test]
+    fn resource_uri_encoding_uses_rfc3986_unreserved_characters() {
+        assert_eq!(
+            percent("https://例.test/a b+%~-._"),
+            "https%3A%2F%2F%E4%BE%8B.test%2Fa%20b%2B%25~-._"
+        );
     }
 }
