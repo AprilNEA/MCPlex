@@ -2,7 +2,6 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
-use rmcp::model::Tool;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -89,9 +88,6 @@ impl ControlClient {
     }
     pub async fn servers(&self) -> Result<StatusResponse> {
         self.request(Method::GET, "servers").await
-    }
-    pub async fn tools(&self) -> Result<Vec<Tool>> {
-        self.request(Method::GET, "tools").await
     }
     pub async fn logs(&self, after: Option<u64>, server: Option<&str>) -> Result<LogsResponse> {
         let mut query = url::form_urlencoded::Serializer::new(String::new());

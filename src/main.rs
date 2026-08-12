@@ -3,10 +3,11 @@ use std::{collections::BTreeMap, fs, io::Read, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use mcplex::config::{
-    Config, ServerConfig, TransportConfig, default_path, persist_atomic, update_atomic,
-    validate_server_id,
+    Config, OAuthConfig, ServerConfig, TransportConfig, default_path, persist_atomic,
+    update_atomic, validate_server_id,
 };
 use mcplex::control::{ControlClient, StatusResponse};
+use rmcp::{ServiceExt, model::Tool, transport::StreamableHttpClientTransport};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
@@ -24,7 +25,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the local multiplexer daemon.
+    /// Run the local MCP gateway daemon.
     Serve {
         /// Keep the process attached to this terminal.
         #[arg(long)]
@@ -32,8 +33,11 @@ enum Command {
     },
     Status,
     Ls {
-        #[arg(long)]
+        #[arg(long, requires = "server")]
         tools: bool,
+        /// List tools from one dedicated server endpoint.
+        #[arg(long, requires = "tools")]
+        server: Option<String>,
     },
     /// Add a server to the configuration.
     Add(AddArgs),
@@ -54,12 +58,17 @@ enum Command {
         client: Client,
         /// Generate a dedicated endpoint for one configured server.
         #[arg(long)]
-        server: Option<String>,
+        server: String,
     },
     /// Manage secrets in the OS keyring.
     Secret {
         #[command(subcommand)]
         command: SecretCommand,
+    },
+    /// Authorize OAuth 2.1 HTTP upstreams.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
     },
     Logs {
         #[arg(short = 'f', long)]
@@ -85,8 +94,12 @@ struct AddArgs {
     env: Vec<String>,
     #[arg(long, requires = "url")]
     header: Vec<String>,
-    #[arg(long)]
-    alias: Option<String>,
+    /// Enable OAuth 2.1 authorization for an HTTP upstream.
+    #[arg(long, requires = "url")]
+    oauth: bool,
+    /// OAuth scope to request (repeatable; server defaults are used when omitted).
+    #[arg(long, requires = "oauth")]
+    scope: Vec<String>,
     #[arg(long)]
     tag: Vec<String>,
     #[arg(long)]
@@ -103,6 +116,14 @@ enum SecretCommand {
     },
     /// Remove a secret.
     Rm { reference: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Open a browser and authorize one configured OAuth upstream.
+    Login { id: String },
+    /// Delete the stored OAuth credentials for one upstream.
+    Logout { id: String },
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -140,15 +161,13 @@ async fn main() -> Result<()> {
             } else {
                 Config::default()
             };
-            if let Some(id) = &server {
-                validate_server_id(id)?;
-                if !config.servers.contains_key(id) {
-                    bail!("unknown server '{id}'");
-                }
+            validate_server_id(&server)?;
+            if !config.servers.contains_key(&server) {
+                bail!("unknown server '{server}'");
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&snippet(&client, &config, server.as_deref()))?
+                serde_json::to_string_pretty(&snippet(&client, &config, &server))?
             );
             Ok(())
         }
@@ -156,17 +175,18 @@ async fn main() -> Result<()> {
             .status()
             .await
             .map(|v| print_status(&v)),
-        Command::Ls { tools } => {
-            let client = ControlClient::load(cli.config)?;
+        Command::Ls { tools, server } => {
             if tools {
-                println!("{}", serde_json::to_string_pretty(&client.tools().await?)?);
+                let server = server.context("--tools requires --server ID")?;
+                list_tools(cli.config, &server).await
             } else {
+                let client = ControlClient::load(cli.config)?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&client.servers().await?)?
                 );
+                Ok(())
             }
-            Ok(())
         }
         Command::Logs { follow, server } => logs(cli.config, follow, server).await,
         Command::Reload => ControlClient::load(cli.config)?
@@ -184,8 +204,43 @@ async fn main() -> Result<()> {
         Command::Add(args) => edit_add(cli.config, args).await,
         Command::Rm { id } => edit_remove(cli.config, &id).await,
         Command::Secret { command } => secret(command),
+        Command::Auth { command } => oauth(command, cli.config).await,
         Command::Doctor => doctor(cli.config).await,
         Command::Tui => mcplex::tui::run(cli.config).await,
+    }
+}
+
+async fn list_tools(path: Option<PathBuf>, server: &str) -> Result<()> {
+    let tools = fetch_tools(path, server).await?;
+    println!("{}", serde_json::to_string_pretty(&tools)?);
+    Ok(())
+}
+
+async fn fetch_tools(path: Option<PathBuf>, server: &str) -> Result<Vec<Tool>> {
+    validate_server_id(server)?;
+    let config_path = path.map_or_else(default_path, Ok)?;
+    let config = Config::load(&config_path)?;
+    let configured = config
+        .servers
+        .get(server)
+        .with_context(|| format!("unknown server '{server}'"))?;
+    if !configured.enabled {
+        bail!("server '{server}' is disabled")
+    }
+    let endpoint = format!(
+        "http://{}/mcp/{server}",
+        socket_authority(config.daemon.bind, config.daemon.port)
+    );
+    let service = ().serve(StreamableHttpClientTransport::from_uri(endpoint)).await?;
+    let tools = service.list_all_tools().await?;
+    service.cancel().await?;
+    Ok(tools)
+}
+
+fn socket_authority(bind: std::net::IpAddr, port: u16) -> String {
+    match bind {
+        std::net::IpAddr::V4(address) => format!("{address}:{port}"),
+        std::net::IpAddr::V6(address) => format!("[{address}]:{port}"),
     }
 }
 
@@ -242,12 +297,14 @@ fn server_from_args(args: &AddArgs) -> Result<ServerConfig> {
         (None, Some(url)) => TransportConfig::Http {
             url: url.clone(),
             headers: parse_pairs(&args.header)?,
+            oauth: args.oauth.then(|| OAuthConfig {
+                scopes: args.scope.clone(),
+            }),
         },
         _ => bail!("exactly one of --command or --url is required"),
     };
     Ok(ServerConfig {
         transport,
-        alias: args.alias.clone(),
         enabled: !args.disabled,
         tags: args.tag.clone(),
     })
@@ -325,6 +382,125 @@ fn secret(command: SecretCommand) -> Result<()> {
     }
     Ok(())
 }
+
+#[derive(Debug, Deserialize)]
+struct OAuthCallback {
+    code: Option<String>,
+    state: Option<String>,
+    iss: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Clone)]
+struct OAuthCallbackState {
+    sender: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<OAuthCallback>>>>,
+}
+
+async fn oauth_callback(
+    axum::extract::State(state): axum::extract::State<OAuthCallbackState>,
+    axum::extract::Query(callback): axum::extract::Query<OAuthCallback>,
+) -> axum::response::Html<&'static str> {
+    if let Some(sender) = state.sender.lock().await.take() {
+        let _ = sender.send(callback);
+    }
+    axum::response::Html("OAuth authorization received. You can close this window.")
+}
+
+fn oauth_server(config: &Config, id: &str) -> Result<(String, OAuthConfig)> {
+    validate_server_id(id)?;
+    let server = config
+        .servers
+        .get(id)
+        .with_context(|| format!("unknown server '{id}'"))?;
+    match &server.transport {
+        TransportConfig::Http {
+            url,
+            oauth: Some(oauth),
+            ..
+        } => Ok((url.clone(), oauth.clone())),
+        TransportConfig::Http { .. } => bail!("server '{id}' does not have OAuth enabled"),
+        TransportConfig::Stdio { .. } => bail!("server '{id}' is not an HTTP upstream"),
+    }
+}
+
+async fn restart_if_reachable(path: Option<PathBuf>, id: &str) -> Result<()> {
+    let client = ControlClient::load(path)?;
+    match client.restart(id).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains("not reachable") => Ok(()),
+        Err(error) => Err(error).context("OAuth credentials changed, but daemon restart failed"),
+    }
+}
+
+async fn oauth(command: AuthCommand, path: Option<PathBuf>) -> Result<()> {
+    let config_path = path.clone().map_or_else(default_path, Ok)?;
+    let config = Config::load(&config_path).with_context(|| {
+        format!(
+            "OAuth requires a configured server in {}",
+            config_path.display()
+        )
+    })?;
+    match command {
+        AuthCommand::Logout { id } => {
+            let (url, _) = oauth_server(&config, &id)?;
+            mcplex::oauth::clear(&id, &url).await?;
+            restart_if_reachable(path, &id).await?;
+            println!("OAuth credentials removed for {id}");
+        }
+        AuthCommand::Login { id } => {
+            let (url, oauth_config) = oauth_server(&config, &id)?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .context("could not bind OAuth callback listener")?;
+            let callback_url = format!("http://{}/oauth/callback", listener.local_addr()?);
+            let mut oauth = mcplex::oauth::authorization_state(&id, &url).await?;
+            let request = rmcp::transport::auth::AuthorizationRequest::new(&callback_url)
+                .with_client_name("MCPlex")
+                .with_scopes(oauth_config.scopes);
+            oauth
+                .start_authorization(request)
+                .await
+                .context("could not start OAuth authorization")?;
+            let authorization_url = oauth.get_authorization_url().await?;
+
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let state = OAuthCallbackState {
+                sender: std::sync::Arc::new(tokio::sync::Mutex::new(Some(sender))),
+            };
+            let app = axum::Router::new()
+                .route("/oauth/callback", axum::routing::get(oauth_callback))
+                .with_state(state);
+            let callback_server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+            println!("Open this URL to authorize {id}:\n{authorization_url}");
+            if let Err(error) = webbrowser::open(&authorization_url) {
+                tracing::warn!(%error, "could not open a browser automatically");
+            }
+            let callback = tokio::time::timeout(std::time::Duration::from_secs(300), receiver)
+                .await
+                .context("OAuth authorization timed out after five minutes")?
+                .context("OAuth callback listener stopped")?;
+            callback_server.abort();
+
+            if let Some(error) = callback.error {
+                bail!(
+                    "OAuth provider returned {error}: {}",
+                    callback.error_description.unwrap_or_default()
+                )
+            }
+            let code = callback.code.context("OAuth callback omitted code")?;
+            let state = callback.state.context("OAuth callback omitted state")?;
+            oauth
+                .handle_callback_with_issuer(&code, &state, callback.iss.as_deref())
+                .await
+                .context("OAuth callback validation or token exchange failed")?;
+            restart_if_reachable(path, &id).await?;
+            println!("OAuth authorization stored for {id}");
+        }
+    }
+    Ok(())
+}
 async fn doctor(path: Option<PathBuf>) -> Result<()> {
     let p = path.clone().map_or_else(default_path, Ok)?;
     let config = if p.exists() {
@@ -362,29 +538,37 @@ async fn doctor(path: Option<PathBuf>) -> Result<()> {
         }
     );
     println!("ok daemon: reachable");
+    let mut failed = false;
     for (id, status) in &v.servers {
         match status.state {
+            mcplex::upstream::State::Idle | mcplex::upstream::State::Ready => {
+                match fetch_tools(Some(p.clone()), id).await {
+                    Ok(tools) => println!(
+                        "ok {id}: dedicated endpoint connected ({} tools)",
+                        tools.len()
+                    ),
+                    Err(error) => {
+                        failed = true;
+                        println!("fail {id}: {error:#}");
+                    }
+                }
+            }
             mcplex::upstream::State::Disabled => {
                 println!("info {id}: disabled; run `mcplex enable {id}` when needed")
             }
-            mcplex::upstream::State::Degraded => println!(
-                "fail {id}: degraded; check `mcplex logs --server {id}` and its command/URL"
-            ),
+            mcplex::upstream::State::Degraded => {
+                failed = true;
+                println!(
+                    "fail {id}: degraded; check `mcplex logs --server {id}` and its command/URL"
+                )
+            }
             mcplex::upstream::State::Starting => {
+                failed = true;
                 println!("fail {id}: still starting; check `mcplex logs --server {id}`")
             }
-            mcplex::upstream::State::Ready => println!(
-                "ok {id}: ready ({} tools, {} resources, {} prompts)",
-                status.tools, status.resources, status.prompts
-            ),
         }
     }
-    if v.servers.values().any(|s| {
-        matches!(
-            s.state,
-            mcplex::upstream::State::Degraded | mcplex::upstream::State::Starting
-        )
-    }) {
+    if failed {
         bail!("doctor found required checks that failed")
     }
     Ok(())
@@ -465,7 +649,6 @@ fn import_config(source: Option<PathBuf>, destination: Option<PathBuf>) -> Resul
                         args: entry.args,
                         env: entry.env,
                     },
-                    alias: None,
                     enabled: true,
                     tags: Vec::new(),
                 },
@@ -478,15 +661,14 @@ fn import_config(source: Option<PathBuf>, destination: Option<PathBuf>) -> Resul
     Ok(imported)
 }
 
-fn endpoint(config: &Config, server: Option<&str>) -> String {
-    let suffix = server.map_or_else(|| "/mcp".to_owned(), |id| format!("/mcp/{id}"));
+fn endpoint(config: &Config, server: &str) -> String {
     format!(
-        "http://{}{suffix}",
+        "http://{}/mcp/{server}",
         std::net::SocketAddr::new(config.daemon.bind, config.daemon.port)
     )
 }
 
-fn snippet(client: &Client, config: &Config, server: Option<&str>) -> Value {
+fn snippet(client: &Client, config: &Config, server: &str) -> Value {
     let url = endpoint(config, server);
     match client {
         Client::ClaudeCode => json!({"mcpServers":{"mcplex":{"type":"http","url":url}}}),
@@ -508,6 +690,17 @@ mod tests {
     }
 
     #[test]
+    fn snippet_requires_a_server() {
+        assert!(Cli::try_parse_from(["mcplex", "snippet", "claude-code"]).is_err());
+        let cli = Cli::try_parse_from(["mcplex", "snippet", "claude-code", "--server", "github"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Snippet { server, .. } if server == "github"
+        ));
+    }
+
+    #[test]
     fn key_value_parsing_preserves_equals_and_rejects_bad_keys() {
         let map = parse_pairs(&["TOKEN=a=b".into()]).unwrap();
         assert_eq!(map["TOKEN"], "a=b");
@@ -524,7 +717,8 @@ mod tests {
             arg: vec!["x".into()],
             env: vec!["A=B".into()],
             header: vec![],
-            alias: Some("d".into()),
+            oauth: false,
+            scope: vec![],
             tag: vec!["work".into()],
             disabled: true,
         };
@@ -556,26 +750,25 @@ mod tests {
                     args: vec![],
                     env: BTreeMap::new(),
                 },
-                alias: None,
                 enabled: false,
                 tags: vec![],
             },
         );
         assert_eq!(
-            snippet(&Client::ClaudeCode, &config, None)["mcpServers"]["mcplex"]["type"],
+            snippet(&Client::ClaudeCode, &config, "github")["mcpServers"]["mcplex"]["type"],
             "http"
         );
         assert!(
-            snippet(&Client::Cursor, &config, None)["mcpServers"]["mcplex"]
+            snippet(&Client::Cursor, &config, "github")["mcpServers"]["mcplex"]
                 .get("type")
                 .is_none()
         );
         assert_eq!(
-            snippet(&Client::ClaudeDesktop, &config, None)["mcpServers"]["mcplex"]["command"],
+            snippet(&Client::ClaudeDesktop, &config, "github")["mcpServers"]["mcplex"]["command"],
             "npx"
         );
         assert_eq!(
-            snippet(&Client::ClaudeCode, &config, Some("github"))["mcpServers"]["mcplex"]["url"],
+            snippet(&Client::ClaudeCode, &config, "github")["mcpServers"]["mcplex"]["url"],
             "http://127.0.0.1:45850/mcp/github"
         );
     }

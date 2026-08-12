@@ -11,7 +11,7 @@ use notify::{RecursiveMode, Watcher};
 use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::*,
-    service::{NotificationContext, RequestContext},
+    service::{NotificationContext, PeerRequestOptions, RequestContext, SubscriptionContext},
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
@@ -22,26 +22,85 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-    time::Instant,
+    sync::{Arc, RwLock as StdRwLock},
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
-use crate::{config::Config, secrets, upstream::Runtime};
+use crate::{
+    config::{Config, ServerConfig},
+    secrets,
+    upstream::{BridgeState, Runtime, RuntimeChange, UpstreamSession},
+};
 
 #[derive(Clone)]
-struct Mux {
+struct SessionProxy {
     runtime: Arc<Runtime>,
-    peers: Arc<RwLock<Vec<rmcp::Peer<RoleServer>>>>,
-    filter: Option<String>,
+    id: Arc<str>,
+    server: ServerConfig,
+    upstream: Arc<Mutex<Option<UpstreamSession>>>,
+    info: Arc<StdRwLock<Option<ServerInfo>>>,
+    bridge: Arc<BridgeState>,
 }
-impl Mux {
-    fn owns(&self, server: &str) -> bool {
-        self.filter.as_ref().is_none_or(|filter| filter == server)
+
+impl SessionProxy {
+    fn new(runtime: Arc<Runtime>, id: Arc<str>, server: ServerConfig) -> Self {
+        Self {
+            runtime,
+            id,
+            server,
+            upstream: Arc::new(Mutex::new(None)),
+            info: Arc::new(StdRwLock::new(None)),
+            bridge: Arc::new(BridgeState::default()),
+        }
+    }
+
+    async fn peer(&self) -> Result<rmcp::Peer<rmcp::RoleClient>, ErrorData> {
+        self.upstream
+            .lock()
+            .await
+            .as_ref()
+            .map(|session| session.peer.clone())
+            .ok_or_else(|| ErrorData::invalid_request("MCP session is not initialized", None))
+    }
+
+    async fn forward(
+        &self,
+        request: ClientRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ServerResult, ErrorData> {
+        let peer = self.peer().await?;
+        let started = Instant::now();
+        let handle = peer
+            .send_cancellable_request(
+                request,
+                PeerRequestOptions::no_options().with_meta(context.meta.clone()),
+            )
+            .await
+            .map_err(service_error)?;
+        let id = handle.id.clone();
+        let progress_token = handle.progress_token.clone();
+        self.bridge
+            .bind_upstream_progress(progress_token.clone(), context.meta.get_progress_token())
+            .await;
+        let result = tokio::select! {
+            result = handle.await_response() => result.map_err(service_error),
+            _ = context.ct.cancelled() => {
+                let _ = peer.notify_cancelled(CancelledNotificationParam::new(
+                    Some(id), Some("originating downstream request cancelled".to_owned())
+                )).await;
+                Err(ErrorData::internal_error("request cancelled", None))
+            }
+        };
+        self.bridge.unbind_upstream_progress(&progress_token).await;
+        self.runtime
+            .record_call(&self.id, started.elapsed().as_millis() as u64)
+            .await;
+        result
     }
 }
+
 fn internal(e: impl std::fmt::Display) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
 }
@@ -51,222 +110,488 @@ fn service_error(e: rmcp::service::ServiceError) -> ErrorData {
         other => internal(other),
     }
 }
-impl ServerHandler for Mux {
+fn unexpected() -> ErrorData {
+    internal(rmcp::service::ServiceError::UnexpectedResponse)
+}
+impl ServerHandler for SessionProxy {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[
-            ProtocolVersion::V_2025_03_26,
-            ProtocolVersion::V_2025_06_18,
-            ProtocolVersion::V_2025_11_25,
-        ])
-    }
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .enable_resources()
-                .enable_resources_list_changed()
-                .enable_prompts()
-                .enable_prompts_list_changed()
-                .build(),
+        Cow::Owned(
+            ProtocolVersion::KNOWN_VERSIONS
+                .iter()
+                .filter(|version| **version <= ProtocolVersion::LATEST)
+                .cloned()
+                .collect(),
         )
-        .with_server_info(Implementation::new("mcplex", env!("CARGO_PKG_VERSION")))
     }
-    async fn on_initialized(&self, c: NotificationContext<RoleServer>) {
-        self.peers.write().await.push(c.peer)
-    }
-    async fn list_tools(
-        &self,
-        _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        let catalog = self.runtime.catalog.read().await;
-        Ok(ListToolsResult::with_all_items(
-            catalog
-                .tools
-                .iter()
-                .filter(|tool| {
-                    catalog
-                        .tool_routes
-                        .get(tool.name.as_ref())
-                        .is_some_and(|route| self.owns(&route.2))
-                })
-                .cloned()
-                .collect(),
-        ))
-    }
-    async fn list_resources(
-        &self,
-        _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        let catalog = self.runtime.catalog.read().await;
-        Ok(ListResourcesResult::with_all_items(
-            catalog
-                .resources
-                .iter()
-                .filter(|resource| {
-                    catalog
-                        .resource_routes
-                        .get(&resource.uri)
-                        .is_some_and(|route| self.owns(&route.2))
-                })
-                .cloned()
-                .collect(),
-        ))
-    }
-    async fn list_prompts(
-        &self,
-        _: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, ErrorData> {
-        let catalog = self.runtime.catalog.read().await;
-        Ok(ListPromptsResult::with_all_items(
-            catalog
-                .prompts
-                .iter()
-                .filter(|prompt| {
-                    catalog
-                        .prompt_routes
-                        .get(&prompt.name)
-                        .is_some_and(|route| self.owns(&route.2))
-                })
-                .cloned()
-                .collect(),
-        ))
-    }
-    async fn call_tool(
-        &self,
-        mut r: CallToolRequestParams,
-        _: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
-        let route = self
-            .runtime
-            .catalog
+
+    fn get_info(&self) -> ServerInfo {
+        self.info
             .read()
-            .await
-            .tool_routes
-            .get(r.name.as_ref())
-            .cloned()
-            .ok_or_else(|| ErrorData::invalid_params("unknown tool", None))?;
-        if !self.owns(&route.2) {
-            return Err(ErrorData::invalid_params("unknown tool", None));
-        }
-        r.name = route.1.into();
-        let id = route.2.clone();
-        let start = Instant::now();
-        let result = route
-            .0
-            .call_tool(r)
-            .await
-            .map(Into::into)
-            .map_err(service_error);
-        self.runtime
-            .record_call(&id, start.elapsed().as_millis() as u64)
-            .await;
-        result
+            .expect("server info lock poisoned")
+            .clone()
+            .unwrap_or_else(|| {
+                ServerInfo::new(ServerCapabilities::default())
+                    .with_server_info(Implementation::new("mcplex", env!("CARGO_PKG_VERSION")))
+            })
     }
-    async fn get_prompt(
+
+    async fn initialize(
         &self,
-        mut r: GetPromptRequestParams,
-        _: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResponse, ErrorData> {
-        let route = self
-            .runtime
-            .catalog
-            .read()
-            .await
-            .prompt_routes
-            .get(&r.name)
-            .cloned()
-            .ok_or_else(|| ErrorData::invalid_params("unknown prompt", None))?;
-        if !self.owns(&route.2) {
-            return Err(ErrorData::invalid_params("unknown prompt", None));
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        context.peer.set_peer_info(request.clone());
+        if !self.server.enabled {
+            return Err(ErrorData::invalid_request(
+                "configured MCP server is disabled",
+                None,
+            ));
         }
-        r.name = route.1;
-        let id = route.2.clone();
-        let start = Instant::now();
-        let result = route
-            .0
-            .get_prompt(r)
+        let session = self
+            .runtime
+            .connect_session(
+                &self.id,
+                &self.server,
+                context.peer.clone(),
+                request,
+                self.bridge.clone(),
+            )
             .await
-            .map(Into::into)
-            .map_err(service_error);
-        self.runtime
-            .record_call(&id, start.elapsed().as_millis() as u64)
-            .await;
-        result
+            .map_err(internal)?;
+        let info = session.info.clone();
+        *self.upstream.lock().await = Some(session);
+        *self.info.write().expect("server info lock poisoned") = Some(info.clone());
+        Ok(info)
     }
-    async fn read_resource(
+
+    async fn discover(
         &self,
-        mut r: ReadResourceRequestParams,
-        _: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResponse, ErrorData> {
-        let public = r.uri.clone();
-        let route = self
-            .runtime
-            .catalog
-            .read()
-            .await
-            .resource_routes
-            .get(&public)
-            .cloned()
-            .ok_or_else(|| ErrorData::invalid_params("unknown resource", None))?;
-        if !self.owns(&route.2) {
-            return Err(ErrorData::invalid_params("unknown resource", None));
+        context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::DiscoverRequest(DiscoverRequest::new(DiscoverRequestParams {})),
+                context,
+            )
+            .await?
+        {
+            ServerResult::DiscoverResult(result) => Ok(result),
+            _ => Err(unexpected()),
         }
-        r.uri = route.1;
-        let id = route.2.clone();
-        let start = Instant::now();
-        let response = route.0.read_resource(r).await.map_err(service_error);
-        self.runtime
-            .record_call(&id, start.elapsed().as_millis() as u64)
-            .await;
-        let mut result: ReadResourceResult = response?;
-        for c in &mut result.contents {
-            match c {
-                ResourceContents::TextResourceContents { uri, .. }
-                | ResourceContents::BlobResourceContents { uri, .. } => *uri = public.clone(),
-                _ => {}
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(requested.clone())
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let peer = self.peer().await?;
+        let mut subscription = peer
+            .listen(context.accepted().clone())
+            .await
+            .map_err(service_error)?;
+        loop {
+            tokio::select! {
+                _ = context.cancelled() => {
+                    subscription
+                        .cancel_with_reason(Some("downstream subscription cancelled".to_owned()))
+                        .await
+                        .map_err(service_error)?;
+                    return Ok(());
+                }
+                notification = subscription.next() => {
+                    let Some(notification) = notification.map_err(service_error)? else {
+                        return Ok(());
+                    };
+                    context.sink().send(notification).await.map_err(internal)?;
+                }
             }
         }
-        Ok(result.into())
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::ListToolsRequest(ListToolsRequest {
+                    method: Default::default(),
+                    params: request,
+                    extensions: Default::default(),
+                }),
+                context,
+            )
+            .await?
+        {
+            ServerResult::ListToolsResult(result) => {
+                self.runtime
+                    .record_inventory(&self.id, Some(result.tools.len()), None, None)
+                    .await;
+                Ok(result)
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::ListResourcesRequest(ListResourcesRequest {
+                    method: Default::default(),
+                    params: request,
+                    extensions: Default::default(),
+                }),
+                context,
+            )
+            .await?
+        {
+            ServerResult::ListResourcesResult(result) => {
+                self.runtime
+                    .record_inventory(&self.id, None, Some(result.resources.len()), None)
+                    .await;
+                Ok(result)
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::ListResourceTemplatesRequest(ListResourceTemplatesRequest {
+                    method: Default::default(),
+                    params: request,
+                    extensions: Default::default(),
+                }),
+                context,
+            )
+            .await?
+        {
+            ServerResult::ListResourceTemplatesResult(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::ListPromptsRequest(ListPromptsRequest {
+                    method: Default::default(),
+                    params: request,
+                    extensions: Default::default(),
+                }),
+                context,
+            )
+            .await?
+        {
+            ServerResult::ListPromptsResult(result) => {
+                self.runtime
+                    .record_inventory(&self.id, None, None, Some(result.prompts.len()))
+                    .await;
+                Ok(result)
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::CallToolRequest(CallToolRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Ok(CallToolResponse::InputRequired(result))
+            }
+            ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::GetPromptRequest(GetPromptRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::GetPromptResult(result) => Ok(GetPromptResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Ok(GetPromptResponse::InputRequired(result))
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::ReadResourceRequest(ReadResourceRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::ReadResourceResult(result) => Ok(ReadResourceResponse::Complete(result)),
+            ServerResult::InputRequiredResult(result) => {
+                Ok(ReadResourceResponse::InputRequired(result))
+            }
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::CompleteRequest(CompleteRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::CompleteResult(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
+
+    #[allow(deprecated)]
+    async fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        match self
+            .forward(
+                ClientRequest::SetLevelRequest(SetLevelRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::EmptyResult(_) => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        match self
+            .forward(
+                ClientRequest::SubscribeRequest(SubscribeRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::EmptyResult(_) => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        match self
+            .forward(
+                ClientRequest::UnsubscribeRequest(UnsubscribeRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::EmptyResult(_) => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        match self
+            .forward(
+                ClientRequest::GetTaskRequest(GetTaskRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::GetTaskResult(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        match self
+            .forward(
+                ClientRequest::UpdateTaskRequest(UpdateTaskRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::TaskAckResult(_) | ServerResult::EmptyResult(_) => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        match self
+            .forward(
+                ClientRequest::CancelTaskRequest(CancelTaskRequest::new(request)),
+                context,
+            )
+            .await?
+        {
+            ServerResult::TaskAckResult(_) | ServerResult::EmptyResult(_) => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
+    async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
+        if let Ok(peer) = self.peer().await {
+            let mut notification = ClientNotification::RootsListChangedNotification(
+                RootsListChangedNotification::default(),
+            );
+            notification.extensions_mut().insert(context.meta);
+            let _ = peer.send_notification(notification).await;
+        }
+    }
+
+    async fn on_progress(
+        &self,
+        notification: ProgressNotificationParam,
+        context: NotificationContext<RoleServer>,
+    ) {
+        if let Some(notification) = self.bridge.forward_upstream_progress(notification).await
+            && let Ok(peer) = self.peer().await
+        {
+            let mut notification =
+                ClientNotification::ProgressNotification(ProgressNotification::new(notification));
+            notification.extensions_mut().insert(context.meta);
+            let _ = peer.send_notification(notification).await;
+        }
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CustomResult, ErrorData> {
+        match self
+            .forward(ClientRequest::CustomRequest(request), context)
+            .await?
+        {
+            ServerResult::CustomResult(result) => Ok(result),
+            _ => Err(internal(rmcp::service::ServiceError::UnexpectedResponse)),
+        }
+    }
+
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        context: NotificationContext<RoleServer>,
+    ) {
+        if let Ok(peer) = self.peer().await {
+            let mut notification = ClientNotification::CustomNotification(notification);
+            notification.extensions_mut().insert(context.meta);
+            let _ = peer.send_notification(notification).await;
+        }
     }
 }
 
-type McpRouters = Arc<RwLock<HashMap<String, Router>>>;
+type McpRouters = Arc<RwLock<HashMap<String, (ServerConfig, Router)>>>;
 
-fn mcp_router(
-    runtime: Arc<Runtime>,
-    peers: Arc<RwLock<Vec<rmcp::Peer<RoleServer>>>>,
-    filter: Option<String>,
-) -> Router {
-    let mux = Mux {
-        runtime,
-        peers,
-        filter,
-    };
+fn mcp_router(runtime: Arc<Runtime>, id: String, server: ServerConfig) -> Router {
+    let id: Arc<str> = id.into();
     let service = StreamableHttpService::new(
-        move || Ok(mux.clone()),
+        move || {
+            Ok(SessionProxy::new(
+                runtime.clone(),
+                id.clone(),
+                server.clone(),
+            ))
+        },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default().with_json_response(true),
     );
     Router::new().route_service("/", service)
 }
 
-async fn sync_mcp_routers(
-    registry: &McpRouters,
-    runtime: &Arc<Runtime>,
-    peers: &Arc<RwLock<Vec<rmcp::Peer<RoleServer>>>>,
-) {
-    let ids: std::collections::HashSet<_> = runtime.config().await.servers.into_keys().collect();
+async fn sync_mcp_routers(registry: &McpRouters, runtime: &Arc<Runtime>, restart: Option<&str>) {
+    let config = runtime.config().await;
     let mut routers = registry.write().await;
-    routers.retain(|id, _| ids.contains(id));
-    for id in ids {
-        routers
-            .entry(id.clone())
-            .or_insert_with(|| mcp_router(runtime.clone(), peers.clone(), Some(id)));
+    routers.retain(|id, _| config.servers.get(id).is_some_and(|server| server.enabled));
+    for (id, server) in config.servers {
+        if !server.enabled {
+            continue;
+        }
+        let unchanged = routers
+            .get(&id)
+            .is_some_and(|(current, _)| current == &server);
+        if !unchanged || restart == Some(id.as_str()) {
+            routers.insert(
+                id.clone(),
+                (server.clone(), mcp_router(runtime.clone(), id, server)),
+            );
+        }
     }
+}
+
+async fn aggregate_removed() -> impl IntoResponse {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "aggregate MCP endpoint removed",
+            "use": "/mcp/{server-id}"
+        })),
+    )
 }
 
 async fn dedicated_mcp(
@@ -274,7 +599,12 @@ async fn dedicated_mcp(
     AxumPath(server): AxumPath<String>,
     mut request: Request<Body>,
 ) -> impl IntoResponse {
-    let router = api.mcp_routers.read().await.get(&server).cloned();
+    let router = api
+        .mcp_routers
+        .read()
+        .await
+        .get(&server)
+        .map(|(_, router)| router.clone());
     let Some(router) = router else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -310,12 +640,6 @@ async fn status(State(s): State<Api>, h: HeaderMap) -> impl IntoResponse {
         return e.into_response();
     }
     Json(json!({"servers":*s.runtime.statuses.read().await})).into_response()
-}
-async fn tools(State(s): State<Api>, h: HeaderMap) -> impl IntoResponse {
-    if let Err(e) = auth(&h, &s) {
-        return e.into_response();
-    }
-    Json(json!(s.runtime.catalog.read().await.tools)).into_response()
 }
 #[derive(serde::Deserialize, Default)]
 struct LogQuery {
@@ -429,19 +753,8 @@ pub async fn serve(config: Config, path: PathBuf) -> Result<()> {
     watcher.watch(parent, RecursiveMode::NonRecursive)?;
     let token = secrets::control_token()?;
     let runtime = Runtime::new(config.clone()).await;
-    let peers = Arc::new(RwLock::new(Vec::new()));
-    let mux = Mux {
-        runtime: runtime.clone(),
-        peers: peers.clone(),
-        filter: None,
-    };
-    let mcp = StreamableHttpService::new(
-        move || Ok(mux.clone()),
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_json_response(true),
-    );
     let registry: McpRouters = Arc::new(RwLock::new(HashMap::new()));
-    sync_mcp_routers(&registry, &runtime, &peers).await;
+    sync_mcp_routers(&registry, &runtime, None).await;
     let api = Api {
         runtime: runtime.clone(),
         mcp_routers: registry.clone(),
@@ -452,14 +765,18 @@ pub async fn serve(config: Config, path: PathBuf) -> Result<()> {
     let mutation = api.mutation.clone();
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route_service("/mcp", mcp)
+        .route(
+            "/mcp",
+            post(aggregate_removed)
+                .delete(aggregate_removed)
+                .get(aggregate_removed),
+        )
         .route(
             "/mcp/{server}",
             post(dedicated_mcp).delete(dedicated_mcp).get(dedicated_mcp),
         )
         .route("/api/v1/status", get(status))
         .route("/api/v1/servers", get(status))
-        .route("/api/v1/tools", get(tools))
         .route("/api/v1/logs", get(logs))
         .route("/api/v1/reload", post(reload))
         .route("/api/v1/servers/{id}/{action}", post(mutate))
@@ -482,28 +799,16 @@ pub async fn serve(config: Config, path: PathBuf) -> Result<()> {
     let mut changes = runtime.subscribe();
     let registry_changes = registry.clone();
     let runtime_changes = runtime.clone();
-    let peers_changes = peers.clone();
     tokio::spawn(async move {
         loop {
-            match changes.recv().await {
-                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            let restart = match changes.recv().await {
+                Ok(RuntimeChange::SyncConfig) => None,
+                Ok(RuntimeChange::Restart(id)) => Some(id),
+                Ok(RuntimeChange::Shutdown) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => None,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-            sync_mcp_routers(&registry_changes, &runtime_changes, &peers_changes).await;
-            let mut keep = Vec::new();
-            let snapshot = peers.read().await.clone();
-            for p in snapshot {
-                let sent = tokio::time::timeout(Duration::from_secs(2), async {
-                    p.notify_tool_list_changed().await?;
-                    p.notify_resource_list_changed().await?;
-                    p.notify_prompt_list_changed().await
-                })
-                .await;
-                if matches!(sent, Ok(Ok(()))) {
-                    keep.push(p.clone())
-                }
-            }
-            *peers.write().await = keep;
+            };
+            sync_mcp_routers(&registry_changes, &runtime_changes, restart.as_deref()).await;
         }
     });
     tracing::info!(%address,"mcplex ready");
@@ -563,15 +868,28 @@ mod tests {
         assert_eq!(result.iter().map(|e| e.id).collect::<Vec<_>>(), [3]);
     }
     #[tokio::test]
-    async fn modern_subscription_protocol_is_not_advertised() {
-        let mux = Mux {
-            runtime: Runtime::new(Config::default()).await,
-            peers: Arc::new(RwLock::new(Vec::new())),
-            filter: None,
-        };
-        let versions = mux.supported_protocol_versions();
+    async fn aggregate_endpoint_returns_gone() {
+        let response = aggregate_removed().await.into_response();
+        assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn future_protocol_is_not_advertised() {
+        let proxy = SessionProxy::new(
+            Runtime::new(Config::default()).await,
+            "unused".into(),
+            ServerConfig {
+                transport: crate::config::TransportConfig::Stdio {
+                    command: "unused".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                },
+                enabled: true,
+                tags: Vec::new(),
+            },
+        );
+        let versions = proxy.supported_protocol_versions();
+        assert!(versions.contains(&ProtocolVersion::LATEST));
         assert!(!versions.contains(&ProtocolVersion::V_2026_07_28));
-        assert_eq!(versions.len(), 3);
-        mux.runtime.shutdown().await;
     }
 }

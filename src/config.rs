@@ -1,10 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    io::Write,
-    net::IpAddr,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs, io::Write, net::IpAddr, path::Path};
 
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
@@ -40,11 +34,16 @@ impl Default for DaemonConfig {
 pub struct ServerConfig {
     #[serde(flatten)]
     pub transport: TransportConfig,
-    pub alias: Option<String>,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct OAuthConfig {
+    pub scopes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -61,6 +60,8 @@ pub enum TransportConfig {
         url: String,
         #[serde(default)]
         headers: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oauth: Option<OAuthConfig>,
     },
 }
 
@@ -103,17 +104,8 @@ impl Config {
             bail!("daemon.bind must be a loopback address in v0");
         }
 
-        let mut prefixes = BTreeSet::new();
         for (id, server) in &self.servers {
             validate_server_id(id)?;
-            if let Some(alias) = &server.alias {
-                validate_server_id(alias)
-                    .with_context(|| format!("invalid alias for server '{id}'"))?;
-            }
-            let prefix = server.alias.as_deref().unwrap_or(id);
-            if !prefixes.insert(prefix) {
-                bail!("duplicate effective server prefix '{prefix}'")
-            }
 
             match &server.transport {
                 TransportConfig::Stdio { command, .. } if command.trim().is_empty() => {
@@ -124,6 +116,17 @@ impl Config {
                         .with_context(|| format!("server '{id}' has an invalid URL"))?;
                     if !matches!(parsed.scheme(), "http" | "https") || !parsed.has_host() {
                         bail!("server '{id}' URL must be an absolute http or https URL")
+                    }
+                    if let TransportConfig::Http {
+                        headers,
+                        oauth: Some(_),
+                        ..
+                    } = &server.transport
+                        && headers
+                            .keys()
+                            .any(|name| name.eq_ignore_ascii_case("authorization"))
+                    {
+                        bail!("server '{id}' cannot combine OAuth with an Authorization header")
                     }
                 }
                 _ => {}
@@ -233,13 +236,22 @@ mod tests {
                 [servers.linear]
                 transport = "http"
                 url = "https://mcp.linear.app/mcp"
-                headers = { Authorization = "keychain:mcplex/linear" }
+
+                [servers.linear.oauth]
+                scopes = ["read", "write"]
             "#,
         )
         .unwrap();
 
         assert_eq!(config.servers.len(), 2);
         assert!(config.servers.values().all(|server| server.enabled));
+        let TransportConfig::Http {
+            oauth: Some(oauth), ..
+        } = &config.servers["linear"].transport
+        else {
+            panic!("linear should use OAuth")
+        };
+        assert_eq!(oauth.scopes, ["read", "write"]);
     }
 
     #[test]
@@ -296,9 +308,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_effective_prefixes() {
-        let error = Config::parse("[servers.a]\ntransport='stdio'\ncommand='x'\nalias='shared'\n[servers.b]\ntransport='stdio'\ncommand='x'\nalias='shared'").unwrap_err();
-        assert!(error.to_string().contains("duplicate effective"));
+    fn rejects_oauth_with_manual_authorization_header() {
+        let error = Config::parse(
+            r#"
+                [servers.remote]
+                transport = "http"
+                url = "https://example.com/mcp"
+                headers = { Authorization = "env:TOKEN" }
+                [servers.remote.oauth]
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot combine OAuth"));
+    }
+
+    #[test]
+    fn rejects_removed_alias_field() {
+        let error = Config::parse("[servers.a]\ntransport='stdio'\ncommand='x'\nalias='old-name'")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field `alias`"));
     }
 
     #[cfg(unix)]

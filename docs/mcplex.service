@@ -1,5 +1,5 @@
 [Unit]
-Description=mcplex local MCP multiplexer
+Description=mcplex local MCP gateway
 After=network-online.target
 
 [Service]

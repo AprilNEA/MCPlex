@@ -1,23 +1,21 @@
 use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     process::Stdio,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use http::{HeaderName, HeaderValue};
 use rmcp::{
-    ClientHandler, Peer, RoleClient, ServiceExt,
-    model::{Prompt, Resource, Tool},
-    service::NotificationContext,
+    ClientHandler, Peer, RoleClient, RoleServer, ServiceExt,
+    model::*,
+    service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError},
     transport::{
-        ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess,
+        ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess, auth::AuthClient,
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
@@ -27,17 +25,16 @@ use tokio::{
     sync::{Mutex, RwLock},
     task::JoinHandle,
 };
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::{Config, ServerConfig, TransportConfig},
-    namespacing::public_name,
-    secrets,
+    oauth, secrets,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
+    Idle,
     Starting,
     Ready,
     Degraded,
@@ -64,90 +61,330 @@ pub struct LogEntry {
     pub message: String,
 }
 
-#[derive(Default)]
-pub struct Catalog {
-    pub tools: Vec<Tool>,
-    pub resources: Vec<Resource>,
-    pub prompts: Vec<Prompt>,
-    pub tool_routes: HashMap<String, (Peer<RoleClient>, String, String)>,
-    pub resource_routes: HashMap<String, (Peer<RoleClient>, String, String)>,
-    pub prompt_routes: HashMap<String, (Peer<RoleClient>, String, String)>,
-    sources: BTreeMap<String, Source>,
-}
-#[derive(Clone)]
-struct Source {
-    prefix: String,
-    generation: u64,
-    peer: Peer<RoleClient>,
-    tools: Vec<Tool>,
-    resources: Vec<Resource>,
-    prompts: Vec<Prompt>,
-}
-
 pub struct Runtime {
-    pub catalog: RwLock<Catalog>,
     pub statuses: RwLock<BTreeMap<String, ServerStatus>>,
     config: RwLock<Config>,
-    tasks: Mutex<HashMap<String, (CancellationToken, JoinHandle<()>)>>,
     pub logs: RwLock<Vec<LogEntry>>,
-    notify: tokio::sync::broadcast::Sender<()>,
+    notify: tokio::sync::broadcast::Sender<RuntimeChange>,
     lifecycle: Mutex<()>,
-    refreshing: Mutex<HashSet<(String, u64, Category)>>,
     shutting_down: AtomicBool,
-    generation: AtomicU64,
     log_id: AtomicU64,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-enum Category {
-    Tools,
-    Resources,
-    Prompts,
+#[derive(Clone, Debug)]
+pub enum RuntimeChange {
+    SyncConfig,
+    Restart(String),
+    Shutdown,
 }
 
-#[derive(Clone)]
-struct UpstreamHandler {
-    runtime: Weak<Runtime>,
-    id: String,
-    generation: u64,
+pub struct UpstreamSession {
+    pub peer: Peer<RoleClient>,
+    pub info: ServerInfo,
+    service_cancel: Option<rmcp::service::RunningServiceCancellationToken>,
+    waiter: JoinHandle<()>,
 }
 
-struct WaiterGuard {
-    token: Option<rmcp::service::RunningServiceCancellationToken>,
-    waiter: tokio::task::AbortHandle,
+#[derive(Default)]
+pub struct BridgeState {
+    upstream_to_downstream_progress: RwLock<HashMap<ProgressToken, ProgressToken>>,
+    downstream_to_upstream_progress: RwLock<HashMap<ProgressToken, ProgressToken>>,
 }
-impl Drop for WaiterGuard {
+
+impl BridgeState {
+    pub async fn bind_upstream_progress(
+        &self,
+        upstream: ProgressToken,
+        downstream: Option<ProgressToken>,
+    ) {
+        if let Some(downstream) = downstream {
+            self.upstream_to_downstream_progress
+                .write()
+                .await
+                .insert(upstream, downstream);
+        }
+    }
+
+    pub async fn unbind_upstream_progress(&self, upstream: &ProgressToken) {
+        self.upstream_to_downstream_progress
+            .write()
+            .await
+            .remove(upstream);
+    }
+
+    pub async fn forward_downstream_progress(
+        &self,
+        mut params: ProgressNotificationParam,
+    ) -> Option<ProgressNotificationParam> {
+        let token = self
+            .upstream_to_downstream_progress
+            .read()
+            .await
+            .get(&params.progress_token)
+            .cloned()?;
+        params.progress_token = token;
+        Some(params)
+    }
+
+    async fn bind_downstream_progress(
+        &self,
+        downstream: ProgressToken,
+        upstream: Option<ProgressToken>,
+    ) {
+        if let Some(upstream) = upstream {
+            self.downstream_to_upstream_progress
+                .write()
+                .await
+                .insert(downstream, upstream);
+        }
+    }
+
+    async fn unbind_downstream_progress(&self, downstream: &ProgressToken) {
+        self.downstream_to_upstream_progress
+            .write()
+            .await
+            .remove(downstream);
+    }
+
+    pub async fn forward_upstream_progress(
+        &self,
+        mut params: ProgressNotificationParam,
+    ) -> Option<ProgressNotificationParam> {
+        let token = self
+            .downstream_to_upstream_progress
+            .read()
+            .await
+            .get(&params.progress_token)
+            .cloned()?;
+        params.progress_token = token;
+        Some(params)
+    }
+}
+
+impl Drop for UpstreamSession {
     fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
+        if let Some(token) = self.service_cancel.take() {
             token.cancel();
         }
         self.waiter.abort();
     }
 }
-impl UpstreamHandler {
-    fn refresh(&self, category: Category, context: NotificationContext<RoleClient>) {
-        let (runtime, id, generation, peer) = (
-            self.runtime.clone(),
-            self.id.clone(),
-            self.generation,
-            context.peer,
-        );
-        tokio::spawn(async move {
-            if let Some(runtime) = runtime.upgrade() {
-                runtime.refresh(&id, generation, category, peer).await;
-            }
-        });
+
+#[derive(Clone)]
+pub struct BridgeClientHandler {
+    pub downstream: Peer<RoleServer>,
+    pub client_info: ClientInfo,
+    pub bridge: Arc<BridgeState>,
+}
+
+fn mcp_error(error: impl std::fmt::Display) -> ErrorData {
+    ErrorData::internal_error(error.to_string(), None)
+}
+
+fn service_error(error: ServiceError) -> ErrorData {
+    match error {
+        ServiceError::McpError(error) => error,
+        other => mcp_error(other),
     }
 }
-impl ClientHandler for UpstreamHandler {
-    async fn on_tool_list_changed(&self, c: NotificationContext<RoleClient>) {
-        self.refresh(Category::Tools, c);
+
+#[allow(deprecated)]
+impl ClientHandler for BridgeClientHandler {
+    fn get_info(&self) -> ClientInfo {
+        self.client_info.clone()
     }
-    async fn on_resource_list_changed(&self, c: NotificationContext<RoleClient>) {
-        self.refresh(Category::Resources, c);
+
+    async fn create_message(
+        &self,
+        params: CreateMessageRequestParams,
+        context: RequestContext<RoleClient>,
+    ) -> Result<CreateMessageResult, ErrorData> {
+        let result = self
+            .forward_reverse(
+                ServerRequest::CreateMessageRequest(CreateMessageRequest::new(params)),
+                context,
+            )
+            .await?;
+        match result {
+            ClientResult::CreateMessageResult(result) => Ok(*result),
+            _ => Err(mcp_error(ServiceError::UnexpectedResponse)),
+        }
     }
-    async fn on_prompt_list_changed(&self, c: NotificationContext<RoleClient>) {
-        self.refresh(Category::Prompts, c);
+
+    async fn list_roots(
+        &self,
+        context: RequestContext<RoleClient>,
+    ) -> Result<ListRootsResult, ErrorData> {
+        let result = self
+            .forward_reverse(
+                ServerRequest::ListRootsRequest(ListRootsRequest::default()),
+                context,
+            )
+            .await?;
+        match result {
+            ClientResult::ListRootsResult(result) => Ok(result),
+            _ => Err(mcp_error(ServiceError::UnexpectedResponse)),
+        }
+    }
+
+    async fn create_elicitation(
+        &self,
+        params: ElicitRequestParams,
+        context: RequestContext<RoleClient>,
+    ) -> Result<ElicitResult, ErrorData> {
+        let result = self
+            .forward_reverse(
+                ServerRequest::ElicitRequest(ElicitRequest::new(params)),
+                context,
+            )
+            .await?;
+        match result {
+            ClientResult::ElicitResult(result) => Ok(result),
+            _ => Err(mcp_error(ServiceError::UnexpectedResponse)),
+        }
+    }
+
+    async fn on_custom_request(
+        &self,
+        request: CustomRequest,
+        context: RequestContext<RoleClient>,
+    ) -> Result<CustomResult, ErrorData> {
+        match self
+            .forward_reverse(ServerRequest::CustomRequest(request), context)
+            .await?
+        {
+            ClientResult::CustomResult(result) => Ok(result),
+            _ => Err(mcp_error(ServiceError::UnexpectedResponse)),
+        }
+    }
+
+    async fn on_logging_message(
+        &self,
+        params: LoggingMessageNotificationParam,
+        context: NotificationContext<RoleClient>,
+    ) {
+        self.send_downstream_notification(
+            ServerNotification::LoggingMessageNotification(LoggingMessageNotification::new(params)),
+            context,
+        )
+        .await;
+    }
+    async fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        context: NotificationContext<RoleClient>,
+    ) {
+        self.send_downstream_notification(
+            ServerNotification::ResourceUpdatedNotification(ResourceUpdatedNotification::new(
+                params,
+            )),
+            context,
+        )
+        .await;
+    }
+    async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) {
+        self.send_downstream_notification(
+            ServerNotification::ToolListChangedNotification(ToolListChangedNotification::default()),
+            context,
+        )
+        .await;
+    }
+    async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) {
+        self.send_downstream_notification(
+            ServerNotification::ResourceListChangedNotification(
+                ResourceListChangedNotification::default(),
+            ),
+            context,
+        )
+        .await;
+    }
+    async fn on_prompt_list_changed(&self, context: NotificationContext<RoleClient>) {
+        self.send_downstream_notification(
+            ServerNotification::PromptListChangedNotification(
+                PromptListChangedNotification::default(),
+            ),
+            context,
+        )
+        .await;
+    }
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        context: NotificationContext<RoleClient>,
+    ) {
+        if let Some(params) = self.bridge.forward_downstream_progress(params).await {
+            self.send_downstream_notification(
+                ServerNotification::ProgressNotification(ProgressNotification::new(params)),
+                context,
+            )
+            .await;
+        }
+    }
+    async fn on_task_status(
+        &self,
+        params: TaskStatusNotificationParams,
+        context: NotificationContext<RoleClient>,
+    ) {
+        self.send_downstream_notification(
+            ServerNotification::TaskStatusNotification(TaskStatusNotification::new(params)),
+            context,
+        )
+        .await;
+    }
+    async fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        context: NotificationContext<RoleClient>,
+    ) {
+        self.send_downstream_notification(
+            ServerNotification::CustomNotification(notification),
+            context,
+        )
+        .await;
+    }
+}
+
+impl BridgeClientHandler {
+    async fn send_downstream_notification(
+        &self,
+        mut notification: ServerNotification,
+        context: NotificationContext<RoleClient>,
+    ) {
+        notification.extensions_mut().insert(context.meta);
+        let _ = self.downstream.send_notification(notification).await;
+    }
+
+    async fn forward_reverse(
+        &self,
+        request: ServerRequest,
+        context: RequestContext<RoleClient>,
+    ) -> Result<ClientResult, ErrorData> {
+        let handle = self
+            .downstream
+            .send_cancellable_request(
+                request,
+                PeerRequestOptions::no_options().with_meta(context.meta.clone()),
+            )
+            .await
+            .map_err(service_error)?;
+        let id = handle.id.clone();
+        let progress_token = handle.progress_token.clone();
+        self.bridge
+            .bind_downstream_progress(progress_token.clone(), context.meta.get_progress_token())
+            .await;
+        let result = tokio::select! {
+            result = handle.await_response() => result.map_err(service_error),
+            _ = context.ct.cancelled() => {
+                let _ = self.downstream.notify_cancelled(CancelledNotificationParam::new(
+                    Some(id), Some("originating upstream request cancelled".to_owned())
+                )).await;
+                Err(ErrorData::internal_error("request cancelled", None))
+            }
+        };
+        self.bridge
+            .unbind_downstream_progress(&progress_token)
+            .await;
+        result
     }
 }
 
@@ -155,35 +392,91 @@ impl Runtime {
     pub async fn new(config: Config) -> Arc<Self> {
         let (notify, _) = tokio::sync::broadcast::channel(16);
         let this = Arc::new(Self {
-            catalog: RwLock::new(Catalog::default()),
             statuses: RwLock::new(BTreeMap::new()),
-            config: RwLock::new(Config {
-                daemon: config.daemon.clone(),
-                servers: BTreeMap::new(),
-            }),
-            tasks: Mutex::new(HashMap::new()),
+            config: RwLock::new(config.clone()),
             logs: RwLock::new(Vec::new()),
             notify,
             lifecycle: Mutex::new(()),
-            refreshing: Mutex::new(HashSet::new()),
             shutting_down: AtomicBool::new(false),
-            generation: AtomicU64::new(1),
             log_id: AtomicU64::new(1),
         });
-        {
-            let _guard = this.lifecycle.lock().await;
-            this.apply_locked(config)
-                .await
-                .expect("initial config is valid");
-        }
+        this.reset_statuses(&config).await;
         this
     }
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<()> {
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<RuntimeChange> {
         self.notify.subscribe()
     }
     pub async fn config(&self) -> Config {
         self.config.read().await.clone()
     }
+
+    async fn reset_statuses(&self, config: &Config) {
+        let old = self.statuses.read().await.clone();
+        let mut statuses = BTreeMap::new();
+        for (id, server) in &config.servers {
+            statuses.insert(
+                id.clone(),
+                ServerStatus {
+                    id: id.clone(),
+                    state: if server.enabled {
+                        State::Idle
+                    } else {
+                        State::Disabled
+                    },
+                    restarts: old.get(id).map_or(0, |s| s.restarts),
+                    error: None,
+                    tools: old.get(id).map_or(0, |s| s.tools),
+                    resources: old.get(id).map_or(0, |s| s.resources),
+                    prompts: old.get(id).map_or(0, |s| s.prompts),
+                    last_call_ms: old.get(id).and_then(|s| s.last_call_ms),
+                },
+            );
+        }
+        *self.statuses.write().await = statuses;
+    }
+
+    pub async fn reload(self: &Arc<Self>, config: Config) -> Result<()> {
+        let _guard = self.lifecycle.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("runtime is shutting down");
+        }
+        if self.config.read().await.daemon != config.daemon {
+            anyhow::bail!("daemon endpoint changed; process restart required");
+        }
+        *self.config.write().await = config.clone();
+        self.reset_statuses(&config).await;
+        let _ = self.notify.send(RuntimeChange::SyncConfig);
+        self.log("configuration reloaded").await;
+        Ok(())
+    }
+
+    pub async fn restart(self: &Arc<Self>, id: &str) -> Result<()> {
+        let _guard = self.lifecycle.lock().await;
+        let config = self.config.read().await.clone();
+        let server = config.servers.get(id).context("unknown server")?;
+        if !server.enabled {
+            anyhow::bail!("server is disabled");
+        }
+        if let Some(status) = self.statuses.write().await.get_mut(id) {
+            status.state = State::Idle;
+            status.restarts += 1;
+            status.error = None;
+            status.tools = 0;
+            status.resources = 0;
+            status.prompts = 0;
+        }
+        let _ = self.notify.send(RuntimeChange::Restart(id.to_owned()));
+        self.log(format!("{id}: sessions restart requested")).await;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        let _guard = self.lifecycle.lock().await;
+        self.shutting_down.store(true, Ordering::Release);
+        let _ = self.notify.send(RuntimeChange::Shutdown);
+    }
+
     pub async fn log(&self, message: impl Into<String>) {
         let message = message.into();
         let server = message.split_once(':').map(|(id, _)| id.to_owned());
@@ -201,490 +494,174 @@ impl Runtime {
             logs.remove(0);
         }
     }
+
     pub async fn record_call(&self, id: &str, elapsed_ms: u64) {
         if let Some(status) = self.statuses.write().await.get_mut(id) {
             status.last_call_ms = Some(elapsed_ms);
         }
     }
-    pub async fn reload(self: &Arc<Self>, config: Config) -> Result<()> {
-        let _guard = self.lifecycle.lock().await;
-        if self.shutting_down.load(Ordering::Acquire) {
-            anyhow::bail!("runtime is shutting down");
-        }
-        self.apply_locked(config).await
-    }
-    async fn apply_locked(self: &Arc<Self>, config: Config) -> Result<()> {
-        let old = self.config.read().await.clone();
-        if old == config {
-            return Ok(());
-        }
-        if old.daemon != config.daemon {
-            anyhow::bail!("daemon endpoint changed; process restart required");
-        }
-        *self.config.write().await = config.clone();
-        let mut changed = Vec::new();
-        for id in old.servers.keys().chain(config.servers.keys()) {
-            if old.servers.get(id) != config.servers.get(id) && !changed.contains(id) {
-                changed.push(id.clone());
-            }
-        }
-        for id in changed {
-            self.stop_locked(&id).await;
-            if let Some(server) = config.servers.get(&id) {
-                if server.enabled {
-                    self.start(id, server.clone()).await
-                } else {
-                    self.set_disabled(&id).await
-                }
-            }
-        }
-        for (id, s) in &config.servers {
-            if !self.statuses.read().await.contains_key(id) {
-                if s.enabled {
-                    self.start(id.clone(), s.clone()).await
-                } else {
-                    self.set_disabled(id).await
-                }
-            }
-        }
-        let _ = self.notify.send(());
-        self.log("configuration reloaded").await;
-        Ok(())
-    }
-    async fn set_disabled(&self, id: &str) {
-        self.statuses.write().await.insert(
-            id.into(),
-            ServerStatus {
-                id: id.into(),
-                state: State::Disabled,
-                restarts: 0,
-                error: None,
-                tools: 0,
-                resources: 0,
-                prompts: 0,
-                last_call_ms: None,
-            },
-        );
-    }
-    async fn start(self: &Arc<Self>, id: String, server: ServerConfig) {
-        let cancel = CancellationToken::new();
-        self.statuses.write().await.insert(
-            id.clone(),
-            ServerStatus {
-                id: id.clone(),
-                state: State::Starting,
-                restarts: 0,
-                error: None,
-                tools: 0,
-                resources: 0,
-                prompts: 0,
-                last_call_ms: None,
-            },
-        );
-        let me = self.clone();
-        let child = cancel.clone();
-        let task_id = id.clone();
-        let handle = tokio::spawn(async move { me.supervise(id, server, child).await });
-        let replaced = self.tasks.lock().await.insert(task_id, (cancel, handle));
-        assert!(replaced.is_none(), "duplicate supervisor task insertion");
-    }
-    async fn stop_locked(&self, id: &str) {
-        if let Some((cancel, mut handle)) = self.tasks.lock().await.remove(id) {
-            cancel.cancel();
-            // rmcp's own cancellation cleanup has a five-second budget. Keep the
-            // supervisor owned long enough for it to cancel and join its waiter.
-            if tokio::time::timeout(Duration::from_secs(10), &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-                let _ = handle.await;
-            }
-        }
-        self.remove_source(id).await;
-        self.statuses.write().await.remove(id);
-    }
-    pub async fn restart(self: &Arc<Self>, id: &str) -> Result<()> {
-        let _guard = self.lifecycle.lock().await;
-        let cfg = self
-            .config
-            .read()
-            .await
-            .servers
-            .get(id)
-            .cloned()
-            .context("unknown server")?;
-        if !cfg.enabled {
-            anyhow::bail!("server is disabled");
-        }
-        self.stop_locked(id).await;
-        self.start(id.into(), cfg).await;
-        Ok(())
-    }
-    async fn supervise(
-        self: Arc<Self>,
-        id: String,
-        server: ServerConfig,
-        cancel: CancellationToken,
+
+    pub async fn record_inventory(
+        &self,
+        id: &str,
+        tools: Option<usize>,
+        resources: Option<usize>,
+        prompts: Option<usize>,
     ) {
-        let mut delay = Duration::from_secs(1);
-        let mut restarts = 0;
-        loop {
-            if cancel.is_cancelled() {
-                break;
+        if let Some(status) = self.statuses.write().await.get_mut(id) {
+            if let Some(tools) = tools {
+                status.tools = tools;
             }
-            self.set_state(&id, State::Starting, restarts, None).await;
-            let result = self.connect_once(&id, &server, restarts, &cancel).await;
-            if cancel.is_cancelled() {
-                break;
+            if let Some(resources) = resources {
+                status.resources = resources;
             }
-            restarts += 1;
-            let error = result.err().map(|e| redact(&e.to_string()));
-            self.remove_source(&id).await;
-            self.set_state(&id, State::Degraded, restarts, error.clone())
-                .await;
-            self.log(format!("{id}: disconnected: {}", error.unwrap_or_default()))
-                .await;
-            tokio::select! { _=cancel.cancelled()=>break, _=tokio::time::sleep(delay)=>{} }
-            delay = (delay * 2).min(Duration::from_secs(30));
+            if let Some(prompts) = prompts {
+                status.prompts = prompts;
+            }
         }
-        self.remove_source(&id).await;
     }
-    async fn connect_once(
+
+    pub async fn connect_session(
         self: &Arc<Self>,
         id: &str,
         server: &ServerConfig,
-        restarts: u64,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
-        match &server.transport {
+        downstream: Peer<RoleServer>,
+        client_info: ClientInfo,
+        bridge: Arc<BridgeState>,
+    ) -> Result<UpstreamSession> {
+        let result = self
+            .connect_session_inner(id, server, downstream, client_info, bridge)
+            .await;
+        if let Err(error) = &result {
+            let error = redact(&format!("{error:#}"));
+            self.set_connection_state(id, State::Degraded, Some(error.clone()))
+                .await;
+            self.log(format!("{id}: connection failed: {error}")).await;
+        }
+        result
+    }
+
+    async fn connect_session_inner(
+        self: &Arc<Self>,
+        id: &str,
+        server: &ServerConfig,
+        downstream: Peer<RoleServer>,
+        client_info: ClientInfo,
+        bridge: Arc<BridgeState>,
+    ) -> Result<UpstreamSession> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            anyhow::bail!("runtime is shutting down");
+        }
+        self.set_connection_state(id, State::Starting, None).await;
+        self.log(format!("{id}: connecting session")).await;
+        let handler = BridgeClientHandler {
+            downstream,
+            client_info,
+            bridge,
+        };
+        let service = match &server.transport {
             TransportConfig::Stdio { command, args, env } => {
                 let mut resolved = Vec::new();
-                for (k, v) in env {
-                    if !v.starts_with("env:") && !v.starts_with("keychain:") {
-                        tracing::warn!(server = id, key = k, "plaintext secret in config")
+                for (key, value) in env {
+                    if !value.starts_with("env:") && !value.starts_with("keychain:") {
+                        tracing::warn!(server = id, key, "plaintext secret in config");
                     }
-                    resolved.push((k.clone(), secrets::resolve(v)?));
+                    resolved.push((key.clone(), secrets::resolve(value)?));
                 }
-                let t = TokioChildProcess::new(Command::new(command).configure(|c| {
+                let transport = TokioChildProcess::new(Command::new(command).configure(|c| {
                     c.args(args).envs(resolved).stderr(Stdio::inherit());
                 }))?;
-                let generation = self.generation.fetch_add(1, Ordering::Relaxed);
-                let handler = UpstreamHandler {
-                    runtime: Arc::downgrade(self),
-                    id: id.into(),
-                    generation,
-                };
-                let service = tokio::time::timeout(Duration::from_secs(10), handler.serve(t))
+                tokio::time::timeout(Duration::from_secs(10), handler.serve(transport))
                     .await
-                    .context("upstream connection timed out")??;
-                self.run_service(id, server, generation, restarts, service, cancel)
-                    .await
+                    .context("upstream connection timed out")??
             }
-            TransportConfig::Http { url, headers } => {
+            TransportConfig::Http {
+                url,
+                headers,
+                oauth: oauth_config,
+            } => {
                 let mut map = HashMap::new();
-                for (k, v) in headers {
-                    if !v.starts_with("env:") && !v.starts_with("keychain:") {
-                        tracing::warn!(server = id, key = k, "plaintext secret in config")
+                for (key, value) in headers {
+                    if !value.starts_with("env:") && !value.starts_with("keychain:") {
+                        tracing::warn!(server = id, key, "plaintext secret in config");
                     }
                     map.insert(
-                        HeaderName::try_from(k)?,
-                        HeaderValue::try_from(secrets::resolve(v)?)?,
+                        HeaderName::try_from(key)?,
+                        HeaderValue::try_from(secrets::resolve(value)?)?,
                     );
                 }
                 let cfg =
                     StreamableHttpClientTransportConfig::with_uri(url.clone()).custom_headers(map);
-                let generation = self.generation.fetch_add(1, Ordering::Relaxed);
-                let handler = UpstreamHandler {
-                    runtime: Arc::downgrade(self),
-                    id: id.into(),
-                    generation,
-                };
-                let service = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    handler.serve(StreamableHttpClientTransport::from_config(cfg)),
-                )
-                .await
-                .context("upstream connection timed out")??;
-                self.run_service(id, server, generation, restarts, service, cancel)
+                if oauth_config.is_some() {
+                    let manager = oauth::authorization_manager(id, url).await?;
+                    let client = AuthClient::new(reqwest::Client::new(), manager);
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        handler.serve(StreamableHttpClientTransport::with_client(client, cfg)),
+                    )
                     .await
+                    .context("upstream connection timed out")??
+                } else {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        handler.serve(StreamableHttpClientTransport::from_config(cfg)),
+                    )
+                    .await
+                    .context("upstream connection timed out")??
+                }
             }
-        }
-    }
-    async fn run_service(
-        &self,
-        id: &str,
-        server: &ServerConfig,
-        generation: u64,
-        restarts: u64,
-        service: rmcp::service::RunningService<RoleClient, UpstreamHandler>,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
+        };
         let peer = service.peer().clone();
-        let capabilities = &service
+        let negotiated = service
             .peer_info()
-            .context("upstream supplied no server info")?
-            .capabilities;
-        let hydrate = async {
-            let tools = if capabilities.tools.is_some() {
-                peer.list_all_tools().await?
-            } else {
-                Vec::new()
-            };
-            let resources = if capabilities.resources.is_some() {
-                peer.list_all_resources().await?
-            } else {
-                Vec::new()
-            };
-            let prompts = if capabilities.prompts.is_some() {
-                peer.list_all_prompts().await?
-            } else {
-                Vec::new()
-            };
-            Ok::<_, rmcp::service::ServiceError>((tools, resources, prompts))
-        };
-        let (tools, resources, prompts) = tokio::time::timeout(Duration::from_secs(10), hydrate)
-            .await
-            .context("initial catalog hydration timed out")??;
-        if cancel.is_cancelled() {
-            service.cancellation_token().cancel();
-            service.waiting().await?;
-            return Ok(());
-        }
-        self.install(
-            id,
-            Source {
-                prefix: server.alias.clone().unwrap_or_else(|| id.into()),
-                generation,
-                peer,
-                tools,
-                resources,
-                prompts,
-            },
-            cancel,
-        )
-        .await?;
-        self.set_state(id, State::Ready, restarts, None).await;
-        let token = service.cancellation_token();
-        let mut waiter = tokio::spawn(async move { service.waiting().await });
-        // If the supervisor itself is force-aborted, cancellation still reaches
-        // rmcp and the consuming waiter cannot become detached.
-        let mut waiter_guard = WaiterGuard {
-            token: Some(token),
-            waiter: waiter.abort_handle(),
-        };
-        tokio::select! {
-            result = &mut waiter => result.context("upstream waiter failed")?.map(|_| ()).map_err(Into::into),
-            _ = cancel.cancelled() => {
-                if let Some(token) = waiter_guard.token.take() { token.cancel(); }
-                waiter.await.context("upstream waiter failed")?.map(|_| ()).map_err(Into::into)
-            }
-        }
-    }
-    async fn install(&self, id: &str, source: Source, cancel: &CancellationToken) -> Result<()> {
-        let mut catalog = self.catalog.write().await;
-        if cancel.is_cancelled() {
-            anyhow::bail!("source stopped during catalog hydration")
-        }
-        let mut sources = catalog.sources.clone();
-        if sources
-            .get(id)
-            .is_some_and(|old| old.generation >= source.generation)
-        {
-            anyhow::bail!("stale source generation")
-        }
-        sources.insert(id.into(), source);
-        let candidate = build_catalog(sources)?;
-        if cancel.is_cancelled() {
-            anyhow::bail!("source stopped during catalog commit")
-        }
-        *catalog = candidate;
-        drop(catalog);
-        let _ = self.notify.send(());
-        Ok(())
-    }
-    async fn remove_source(&self, id: &str) {
-        let mut catalog = self.catalog.write().await;
-        let mut sources = catalog.sources.clone();
-        if sources.remove(id).is_some() {
-            *catalog = build_catalog(sources).expect("source removal must be valid");
-            drop(catalog);
-            let _ = self.notify.send(());
-        }
-    }
-    async fn set_state(&self, id: &str, state: State, restarts: u64, error: Option<String>) {
-        let c = self.catalog.read().await;
-        let tools = c
-            .tools
-            .iter()
-            .filter(|t| {
-                c.tool_routes
-                    .get(t.name.as_ref())
-                    .is_some_and(|r| r.2 == id)
-            })
-            .count();
-        let resources = c.resource_routes.values().filter(|r| r.2 == id).count();
-        let prompts = c.prompt_routes.values().filter(|r| r.2 == id).count();
-        drop(c);
-        if let Some(s) = self.statuses.write().await.get_mut(id) {
-            s.state = state;
-            s.restarts = restarts;
-            s.error = error;
-            s.tools = tools;
-            s.resources = resources;
-            s.prompts = prompts;
-        }
-    }
-    pub async fn shutdown(&self) {
-        let _guard = self.lifecycle.lock().await;
-        self.shutting_down.store(true, Ordering::Release);
-        let ids: Vec<_> = self.tasks.lock().await.keys().cloned().collect();
-        for id in ids {
-            self.stop_locked(&id).await;
-        }
-    }
-
-    async fn refresh(&self, id: &str, generation: u64, category: Category, peer: Peer<RoleClient>) {
-        let key = (id.to_owned(), generation, category);
-        if !self.refreshing.lock().await.insert(key.clone()) {
-            return;
-        }
-        if self
-            .catalog
-            .read()
-            .await
-            .sources
-            .get(id)
-            .is_none_or(|s| s.generation != generation)
-        {
-            self.refreshing.lock().await.remove(&key);
-            return;
-        }
-        let request = async {
-            match category {
-                Category::Tools => peer.list_all_tools().await.map(|v| (Some(v), None, None)),
-                Category::Resources => peer
-                    .list_all_resources()
-                    .await
-                    .map(|v| (None, Some(v), None)),
-                Category::Prompts => peer.list_all_prompts().await.map(|v| (None, None, Some(v))),
-            }
-        };
-        let result = tokio::time::timeout(Duration::from_secs(10), request).await;
-        self.refreshing.lock().await.remove(&key);
-        let Ok(Ok((tools, resources, prompts))) = result else {
-            return;
-        };
-        let mut c = self.catalog.write().await;
-        let mut sources = c.sources.clone();
-        let Some(source) = sources.get_mut(id).filter(|s| s.generation == generation) else {
-            return;
-        };
-        if let Some(v) = tools {
-            source.tools = v;
-        }
-        if let Some(v) = resources {
-            source.resources = v;
-        }
-        if let Some(v) = prompts {
-            source.prompts = v;
-        }
-        let Ok(candidate) = build_catalog(sources) else {
-            return;
-        };
-        if c.sources.get(id).is_none_or(|s| s.generation != generation) {
-            return;
-        }
-        *c = candidate;
-        drop(c);
-        let _ = self.notify.send(());
-    }
-}
-
-/// Build and validate every derived route off-lock; callers swap the result atomically.
-fn build_catalog(sources: BTreeMap<String, Source>) -> Result<Catalog> {
-    let mut catalog = Catalog {
-        sources: sources.clone(),
-        ..Catalog::default()
-    };
-    let mut uri_counts = HashMap::new();
-    for source in sources.values() {
-        for resource in &source.resources {
-            *uri_counts.entry(resource.uri.clone()).or_insert(0usize) += 1;
-        }
-    }
-    for (id, source) in sources {
-        for mut tool in source.tools {
-            let upstream = tool.name.to_string();
-            let public = public_name(&source.prefix, &upstream);
-            tool.name = Cow::Owned(public.clone());
-            if catalog
-                .tool_routes
-                .insert(public.clone(), (source.peer.clone(), upstream, id.clone()))
-                .is_some()
+            .context("upstream supplied no server info")?;
+        let mut info = ServerInfo::new(negotiated.capabilities.clone())
+            .with_protocol_version(negotiated.protocol_version.clone())
+            .with_server_info(
+                negotiated
+                    .server_info
+                    .clone()
+                    .context("upstream supplied no implementation info")?,
+            );
+        info.instructions = negotiated.instructions.clone();
+        info.meta = negotiated.meta.clone();
+        let runtime = Arc::downgrade(self);
+        let session_id = id.to_owned();
+        let service_cancel = service.cancellation_token();
+        let waiter = tokio::spawn(async move {
+            if let Err(error) = service.waiting().await
+                && let Some(runtime) = runtime.upgrade()
             {
-                anyhow::bail!("duplicate public tool route '{public}'");
+                runtime
+                    .log(format!("{session_id}: disconnected: {error}"))
+                    .await;
+                runtime
+                    .set_connection_state(
+                        &session_id,
+                        State::Degraded,
+                        Some(redact(&error.to_string())),
+                    )
+                    .await;
             }
-            catalog.tools.push(tool);
-        }
-        for mut prompt in source.prompts {
-            let upstream = prompt.name.clone();
-            let public = public_name(&source.prefix, &upstream);
-            prompt.name = public.clone();
-            if catalog
-                .prompt_routes
-                .insert(public.clone(), (source.peer.clone(), upstream, id.clone()))
-                .is_some()
-            {
-                anyhow::bail!("duplicate public prompt route '{public}'");
-            }
-            catalog.prompts.push(prompt);
-        }
-        for mut resource in source.resources {
-            let original = resource.uri.clone();
-            let public = if uri_counts[&original] > 1 {
-                format!("mcplex+{}:{}", source.prefix, percent(&original))
-            } else {
-                original.clone()
-            };
-            resource.uri = public.clone();
-            if catalog
-                .resource_routes
-                .insert(public.clone(), (source.peer.clone(), original, id.clone()))
-                .is_some()
-            {
-                anyhow::bail!("duplicate public resource route '{public}'");
-            }
-            catalog.resources.push(resource);
+        });
+        self.set_connection_state(id, State::Ready, None).await;
+        self.log(format!("{id}: session connected")).await;
+        Ok(UpstreamSession {
+            peer,
+            info,
+            service_cancel: Some(service_cancel),
+            waiter,
+        })
+    }
+
+    async fn set_connection_state(&self, id: &str, state: State, error: Option<String>) {
+        if let Some(status) = self.statuses.write().await.get_mut(id) {
+            status.state = state;
+            status.error = error;
         }
     }
-    validate_route_keys("tool", catalog.tool_routes.keys().map(String::as_str))?;
-    validate_route_keys("prompt", catalog.prompt_routes.keys().map(String::as_str))?;
-    validate_route_keys(
-        "resource",
-        catalog.resource_routes.keys().map(String::as_str),
-    )?;
-    Ok(catalog)
 }
 
-fn validate_route_keys<'a>(kind: &str, keys: impl IntoIterator<Item = &'a str>) -> Result<()> {
-    let mut seen = HashSet::new();
-    for key in keys {
-        if !seen.insert(key) {
-            anyhow::bail!("duplicate public {kind} route '{key}'");
-        }
-    }
-    Ok(())
-}
-
-fn percent(value: &str) -> String {
-    const URI_COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-        .remove(b'-')
-        .remove(b'.')
-        .remove(b'_')
-        .remove(b'~');
-    percent_encoding::utf8_percent_encode(value, URI_COMPONENT).to_string()
-}
 fn redact(s: &str) -> String {
     let mut output = Vec::new();
     let mut redact_next = false;
@@ -730,7 +707,6 @@ mod tests {
                     args: vec![],
                     env: BTreeMap::new(),
                 },
-                alias: None,
                 enabled: false,
                 tags: vec![],
             },
@@ -738,24 +714,45 @@ mod tests {
         let runtime = Runtime::new(config).await;
         runtime.record_call("test", 42).await;
         assert_eq!(runtime.statuses.read().await["test"].last_call_ms, Some(42));
-        runtime.shutdown().await;
     }
     #[test]
     fn redaction_hides_credentials_but_keeps_diagnostics() {
         assert_eq!(redact("connection refused"), "connection refused");
         assert!(!redact("Bearer abc token=xyz password:bad").contains("abc"));
     }
-    #[test]
-    fn route_key_validation_rejects_candidate_collisions() {
-        assert!(validate_route_keys("tool", ["a__one", "b__one"]).is_ok());
-        let error = validate_route_keys("tool", ["same", "same"]).unwrap_err();
-        assert_eq!(error.to_string(), "duplicate public tool route 'same'");
-    }
-    #[test]
-    fn resource_uri_encoding_uses_rfc3986_unreserved_characters() {
-        assert_eq!(
-            percent("https://例.test/a b+%~-._"),
-            "https%3A%2F%2F%E4%BE%8B.test%2Fa%20b%2B%25~-._"
+
+    #[tokio::test]
+    async fn progress_tokens_are_translated_in_both_directions() {
+        let bridge = BridgeState::default();
+        let downstream = ProgressToken(NumberOrString::String("downstream".into()));
+        let upstream = ProgressToken(NumberOrString::String("upstream".into()));
+
+        bridge
+            .bind_upstream_progress(upstream.clone(), Some(downstream.clone()))
+            .await;
+        let forwarded = bridge
+            .forward_downstream_progress(ProgressNotificationParam::new(upstream.clone(), 1.0))
+            .await
+            .expect("mapped upstream token");
+        assert_eq!(forwarded.progress_token, downstream);
+        bridge.unbind_upstream_progress(&upstream).await;
+        assert!(
+            bridge
+                .forward_downstream_progress(ProgressNotificationParam::new(upstream, 2.0))
+                .await
+                .is_none()
         );
+
+        let upstream = ProgressToken(NumberOrString::String("upstream-reverse".into()));
+        let downstream = ProgressToken(NumberOrString::String("downstream-reverse".into()));
+        bridge
+            .bind_downstream_progress(downstream.clone(), Some(upstream.clone()))
+            .await;
+        let forwarded = bridge
+            .forward_upstream_progress(ProgressNotificationParam::new(downstream.clone(), 3.0))
+            .await
+            .expect("mapped downstream token");
+        assert_eq!(forwarded.progress_token, upstream);
+        bridge.unbind_downstream_progress(&downstream).await;
     }
 }
