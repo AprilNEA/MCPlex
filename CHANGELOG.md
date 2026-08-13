@@ -9,11 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.5.2] - 2026-08-13
 
-### Fixed
-
-- avoid macOS keychain prompts
-
-
 ### Changed
 
 - avoid automatic macOS Keychain prompts by keeping the local control token in a
