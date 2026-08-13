@@ -1,4 +1,4 @@
-# mcplex 0.4.0 (public beta)
+# mcplex 0.5.0 (public beta)
 
 mcplex is a single-user, local MCP gateway. Each configured stdio or Streamable HTTP
 server gets its own loopback Streamable HTTP endpoint at `/mcp/{server-id}`. Names and
