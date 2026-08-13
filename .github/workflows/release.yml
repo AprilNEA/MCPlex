@@ -271,12 +271,6 @@ jobs:
           persist-credentials: false
           submodules: recursive
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || '' }}
-      - name: Mint GitHub App token
-        id: app-token
-        uses: ./.github/actions/github-app-token-from-1password
-        with:
-          op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
-          op-github-app-item: ${{ secrets.OP_GITHUB_APP_ITEM }}
       - name: Install cached dist
         uses: actions/download-artifact@v4
         with:
@@ -316,7 +310,6 @@ jobs:
           rm -f artifacts/*-dist-manifest.json
       - name: Create GitHub Release
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
