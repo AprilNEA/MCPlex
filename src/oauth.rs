@@ -17,7 +17,8 @@ impl KeychainCredentialStore {
     }
 
     fn entry(&self) -> Result<keyring::Entry, AuthError> {
-        keyring::Entry::new("mcplex", &self.account).map_err(|error| storage_error("open", error))
+        keyring::Entry::new("com.aprilnea.mcplex", &self.account)
+            .map_err(|error| storage_error("open", error))
     }
 }
 
@@ -102,6 +103,6 @@ mod tests {
         let first = KeychainCredentialStore::new("linear", "https://mcp.linear.app/mcp");
         let second = KeychainCredentialStore::new("linear", "https://example.test/mcp");
         assert_ne!(first.account, second.account);
-        assert!(first.account.contains("linear"));
+        assert!(first.account.starts_with("oauth:linear:"));
     }
 }

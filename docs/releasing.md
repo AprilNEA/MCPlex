@@ -36,6 +36,8 @@ its own `GITHUB_TOKEN` with `contents: write` to update `Formula/mcplex.rb`.
 6. cargo-dist builds Linux and macOS archives. The release workflow signs the
    macOS `mcplex` and `mcplex-daemon` executables as
    `com.aprilnea.mcplex.cli` and `com.aprilnea.mcplex.daemon`, respectively,
+   with one mutually compatible designated requirement so newly created
+   Keychain items can be used by either executable without an authorization prompt,
    then submits each architecture to Apple's notary service before repackaging.
    These are explicit identifiers on the bare Mach-O signatures; the
    `com.aprilnea.mcplex` root remains available for a future native app bundle.

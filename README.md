@@ -60,8 +60,9 @@ enabled = true
 
 Environment/header values can be literal, `env:NAME`, or `keychain:service/account`.
 Literal credentials are discouraged. The authenticated control API token comes from
-`MCPLEX_CONTROL_TOKEN` when non-empty, otherwise OS keyring entry
-`mcplex/control-token` (created if absent). MCP endpoints are unauthenticated.
+`MCPLEX_CONTROL_TOKEN` when non-empty. Otherwise macOS uses a generated `config.token`
+sibling with owner-only permissions, while other platforms use the OS keyring. MCP
+endpoints are unauthenticated.
 
 Config writes are atomic and private on Unix. A sibling advisory lock serializes CLI and
 daemon updates. Config changes are hot-reloaded; changing bind/port requires a restart.
@@ -69,7 +70,12 @@ daemon updates. Config changes are hot-reloaded; changing bind/port requires a r
 OAuth HTTP upstreams use rmcp's OAuth 2.1 implementation: protected-resource and
 authorization-server discovery, Dynamic Client Registration, PKCE S256, RFC 8707
 resource binding, issuer validation, automatic refresh, and OS-keyring persistence. The
-browser callback binds a random loopback port for at most five minutes. Linear example:
+signed macOS CLI and daemon share a narrowly scoped designated requirement so credentials
+created by either are available to both without a first-access prompt. Credentials from
+versions before 0.5.2 are deliberately not accessed; run `auth login` again after upgrading.
+Explicit `keychain:` references remain subject to macOS authorization when another code
+identity created them. The browser callback binds a random loopback port for at most five
+minutes. Linear example:
 
 ```sh
 mcplex add linear --url https://mcp.linear.app/mcp --oauth

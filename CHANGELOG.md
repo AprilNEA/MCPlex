@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- avoid automatic macOS Keychain prompts by keeping the local control token in a
+  private file and signing the CLI and daemon with a shared designated requirement
+- use a new app-owned OAuth Keychain service; existing OAuth connections must be
+  authorized again with `mcplex auth login ID`
+
 ## [0.5.1] - 2026-08-13
 
 ### Added

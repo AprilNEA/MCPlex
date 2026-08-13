@@ -14,6 +14,10 @@ esac
 : "${APPLE_ID:?APPLE_ID is required}"
 : "${APPLE_PASSWORD:?APPLE_PASSWORD is required}"
 : "${APPLE_TEAM_ID:?APPLE_TEAM_ID is required}"
+[[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] || {
+  echo "APPLE_TEAM_ID must be a 10-character Apple Team ID" >&2
+  exit 1
+}
 
 archives=(target/distrib/mcplex-*"$target".tar.xz)
 if [[ ${#archives[@]} -ne 1 || ! -f "${archives[0]}" ]]; then
@@ -34,6 +38,18 @@ if [[ ${#roots[@]} -ne 1 || ! -d "${roots[0]}" ]]; then
 fi
 root="${roots[0]}"
 
+shared_requirement="$work/mcplex-keychain.req"
+cat > "$shared_requirement" <<EOF
+designated => anchor apple generic
+  and certificate 1[field.1.2.840.113635.100.6.2.6] exists
+  and certificate leaf[field.1.2.840.113635.100.6.1.13] exists
+  and certificate leaf[subject.OU] = "$APPLE_TEAM_ID"
+  and (identifier "com.aprilnea.mcplex.cli"
+       or identifier "com.aprilnea.mcplex.daemon")
+EOF
+shared_expression="$work/mcplex-keychain-expression.req"
+sed '1s/^designated => //' "$shared_requirement" > "$shared_expression"
+
 sign_and_verify() {
   local binary="$1"
   local identifier="$2"
@@ -47,9 +63,13 @@ sign_and_verify() {
     --options runtime \
     --timestamp \
     --identifier "$identifier" \
+    --requirements "$shared_requirement" \
     --sign "$APPLE_SIGNING_IDENTITY" \
     "$binary"
   codesign --verify --strict --verbose=2 "$binary"
+  codesign --verify --strict --verbose=2 \
+    --test-requirement "$shared_expression" \
+    "$binary"
 
   local details
   details="$(codesign --display --verbose=4 "$binary" 2>&1)"
@@ -59,6 +79,15 @@ sign_and_verify() {
 
 sign_and_verify "$root/mcplex" "com.aprilnea.mcplex.cli"
 sign_and_verify "$root/mcplex-daemon" "com.aprilnea.mcplex.daemon"
+
+cli_requirement="$(codesign --display -r- "$root/mcplex" 2>&1 | sed -n '/designated =>/p')"
+daemon_requirement="$(codesign --display -r- "$root/mcplex-daemon" 2>&1 | sed -n '/designated =>/p')"
+[[ -n "$cli_requirement" && "$cli_requirement" == "$daemon_requirement" ]] || {
+  echo "mcplex and mcplex-daemon do not have identical designated requirements" >&2
+  exit 1
+}
+grep -Fq 'identifier "com.aprilnea.mcplex.cli"' <<<"$cli_requirement"
+grep -Fq 'identifier "com.aprilnea.mcplex.daemon"' <<<"$cli_requirement"
 
 notarization_zip="$work/mcplex-$target-notarization.zip"
 ditto -c -k --keepParent "$root" "$notarization_zip"

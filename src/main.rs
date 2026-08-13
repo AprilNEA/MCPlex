@@ -517,13 +517,15 @@ async fn doctor(path: Option<PathBuf>) -> Result<()> {
             " (missing; defaults are valid)"
         }
     );
-    mcplex::secrets::control_token()
-        .context("control token unavailable; configure MCPLEX_CONTROL_TOKEN or keyring")?;
+    mcplex::secrets::control_token(&p)
+        .context("control token unavailable; configure MCPLEX_CONTROL_TOKEN or fix its storage")?;
     let v = ControlClient::load(path)?.status().await?;
     println!(
         "ok control token: {}",
         if std::env::var("MCPLEX_CONTROL_TOKEN").is_ok() {
             "MCPLEX_CONTROL_TOKEN"
+        } else if cfg!(target_os = "macos") {
+            "private file"
         } else {
             "OS keyring"
         }

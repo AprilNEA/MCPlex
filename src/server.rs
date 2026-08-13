@@ -962,7 +962,7 @@ pub async fn serve(config: Config, path: PathBuf) -> Result<()> {
         }
     })?;
     watcher.watch(parent, RecursiveMode::NonRecursive)?;
-    let token = secrets::control_token()?;
+    let token = secrets::control_token(&path)?;
     let runtime = Runtime::new(config.clone()).await;
     let registry: McpRouters = Arc::new(RwLock::new(HashMap::new()));
     sync_mcp_routers(&registry, &runtime, None).await;

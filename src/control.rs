@@ -54,7 +54,7 @@ impl ControlClient {
                 config.daemon.bind,
                 config.daemon.port,
             )),
-            token: secrets::control_token()?,
+            token: secrets::control_token(&path)?,
             http: reqwest::Client::new(),
         })
     }
