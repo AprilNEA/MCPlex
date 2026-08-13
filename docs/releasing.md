@@ -41,9 +41,9 @@ first verify that the exact version exists on crates.io, then recover the missin
 tag by manually running the Release PR workflow with `release_tag` set to the
 missing `vX.Y.Z`. The recovery validates the exact release line, version, and
 merged `master` ancestry before using the GitHub App token. When the exact crate
-version is already published, it switches release-plz to git-only mode so the tag
-is created without attempting another crates.io upload and cargo-dist is triggered
-from the original release commit.
+version is already published, it creates the missing tag through the GitHub API
+without attempting another crates.io upload, so cargo-dist is triggered from the
+original release commit.
 
 If a tag exists but cargo-dist cannot complete because its original runner image
 was retired, first update `github-custom-runners` and the Release workflow on

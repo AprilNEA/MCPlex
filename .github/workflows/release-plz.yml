@@ -140,19 +140,28 @@ jobs:
         with:
           op-service-account-token: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
           op-github-app-item: ${{ secrets.OP_GITHUB_APP_ITEM }}
-      - name: Select release mode
+      - name: Check publication state
         if: env.skip != 'true'
+        id: publication
         shell: bash
         run: |
           set -euo pipefail
           version="${release_tag#v}"
           if cargo info "mcplex@${version}" --registry crates-io >/dev/null 2>&1; then
-            sed -i '/^\[\[package\]\]/,$ s/^publish = true$/publish = false/' release-plz.toml
-            grep -Fxq 'publish = false' release-plz.toml
-            echo "mcplex ${version} is already published; creating only the missing Git tag."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Create missing tag for published crate
+        if: env.skip != 'true' && steps.publication.outputs.published == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/${release_tag}" \
+            -f sha="${release_sha}"
       - name: Publish crate and create tag
-        if: env.skip != 'true'
+        if: env.skip != 'true' && steps.publication.outputs.published != 'true'
         uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
         with:
           command: release
