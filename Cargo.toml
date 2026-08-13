@@ -8,6 +8,10 @@ repository = "https://github.com/AprilNEA/MCPlex"
 homepage = "https://github.com/AprilNEA/MCPlex"
 rust-version = "1.88"
 
+[workspace]
+exclude = ["vendor/rmcp"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
@@ -16,7 +20,7 @@ clap = { version = "4.5", features = ["derive"] }
 config-rs = { package = "config", version = "0.15.25", default-features = false, features = ["toml"] }
 crossterm = "=0.29.0"
 directories = "6.0"
-rmcp = { version = "=3.1.2", features = ["auth", "client", "elicitation", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+rmcp = { package = "mcplex-rmcp", version = "=3.1.2-mcplex.2", path = "vendor/rmcp", features = ["auth", "client", "elicitation", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
 http = "1"
 keyring = { version = "3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust", "apple-native", "vendored"] }
 fs2 = "0.4"

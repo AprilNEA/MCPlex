@@ -82,9 +82,12 @@ claude mcp add --scope user --transport http linear http://127.0.0.1:45850/mcp/l
 ## Dedicated transparent endpoints
 
 Only `/mcp/{server-id}` is served; the former aggregate `/mcp` endpoint is removed.
-Every downstream session connects to one independent upstream session. This one-to-one
-relationship allows requests, responses, names, and URIs to pass through without public
-prefixes or collision rewriting. Unknown and removed IDs return HTTP 404.
+Legacy downstream sessions connect to independent upstream sessions. MCP `2026-07-28`
+requests use the revision's stateless discover lifecycle and self-contained request
+metadata. Both paths preserve names and URIs without public prefixes or collision
+rewriting. Unknown and removed IDs return HTTP 404. See the
+[protocol support matrix](docs/protocol-support.md) for modern MRTR, tasks, subscriptions,
+and transport details.
 
 ```sh
 mcplex snippet claude-code --server github

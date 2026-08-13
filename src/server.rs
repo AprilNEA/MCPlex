@@ -4,6 +4,7 @@ use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, Request, StatusCode, Uri},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -42,10 +43,53 @@ struct SessionProxy {
     upstream: Arc<Mutex<Option<UpstreamSession>>>,
     info: Arc<StdRwLock<Option<ServerInfo>>>,
     bridge: Arc<BridgeState>,
+    shared: Arc<SharedUpstream>,
+}
+
+struct SharedUpstream {
+    upstream: Mutex<Option<UpstreamSession>>,
+    info: StdRwLock<Option<ServerInfo>>,
+    bridge: Arc<BridgeState>,
+}
+
+impl SharedUpstream {
+    async fn connect(
+        &self,
+        runtime: &Arc<Runtime>,
+        id: &str,
+        server: &ServerConfig,
+        client_info: ClientInfo,
+    ) -> Result<rmcp::Peer<rmcp::RoleClient>> {
+        let mut upstream = self.upstream.lock().await;
+        if upstream
+            .as_ref()
+            .is_some_and(|session| session.peer.is_transport_closed())
+        {
+            *upstream = None;
+            *self.info.write().expect("server info lock poisoned") = None;
+        }
+        if upstream.is_none() {
+            let session = runtime
+                .connect_session(id, server, None, client_info, self.bridge.clone())
+                .await?;
+            *self.info.write().expect("server info lock poisoned") = Some(session.info.clone());
+            *upstream = Some(session);
+        }
+        Ok(upstream
+            .as_ref()
+            .expect("shared upstream initialized")
+            .peer
+            .clone())
+    }
 }
 
 impl SessionProxy {
-    fn new(runtime: Arc<Runtime>, id: Arc<str>, server: ServerConfig) -> Self {
+    fn new(
+        runtime: Arc<Runtime>,
+        id: Arc<str>,
+        server: ServerConfig,
+        shared: Arc<SharedUpstream>,
+    ) -> Self {
         Self {
             runtime,
             id,
@@ -53,10 +97,11 @@ impl SessionProxy {
             upstream: Arc::new(Mutex::new(None)),
             info: Arc::new(StdRwLock::new(None)),
             bridge: Arc::new(BridgeState::default()),
+            shared,
         }
     }
 
-    async fn peer(&self) -> Result<rmcp::Peer<rmcp::RoleClient>, ErrorData> {
+    async fn legacy_peer(&self) -> Result<rmcp::Peer<rmcp::RoleClient>, ErrorData> {
         self.upstream
             .lock()
             .await
@@ -65,12 +110,70 @@ impl SessionProxy {
             .ok_or_else(|| ErrorData::invalid_request("MCP session is not initialized", None))
     }
 
+    fn client_info(context: &RequestContext<RoleServer>) -> Result<ClientInfo, ErrorData> {
+        let capabilities = context.client_capabilities().ok_or_else(|| {
+            ErrorData::invalid_request("request omitted client capabilities", None)
+        })?;
+        let implementation = context
+            .client_info()
+            .unwrap_or_else(|| Implementation::new("mcplex", env!("CARGO_PKG_VERSION")));
+        Ok(
+            ClientInfo::new(capabilities, implementation).with_protocol_version(
+                context
+                    .protocol_version()
+                    .unwrap_or(ProtocolVersion::V_2026_07_28),
+            ),
+        )
+    }
+
+    async fn ensure_shared(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(rmcp::Peer<rmcp::RoleClient>, Arc<BridgeState>), ErrorData> {
+        let peer = self
+            .shared
+            .connect(
+                &self.runtime,
+                &self.id,
+                &self.server,
+                Self::client_info(context)?,
+            )
+            .await
+            .map_err(internal)?;
+        Ok((peer, self.shared.bridge.clone()))
+    }
+
+    async fn upstream_for(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(rmcp::Peer<rmcp::RoleClient>, Arc<BridgeState>), ErrorData> {
+        if context
+            .meta
+            .missing_required_keys(&ProtocolVersion::V_2026_07_28)
+            .is_empty()
+        {
+            self.ensure_shared(context).await
+        } else {
+            Ok((self.legacy_peer().await?, self.bridge.clone()))
+        }
+    }
+
     async fn forward(
         &self,
-        request: ClientRequest,
+        mut request: ClientRequest,
         context: RequestContext<RoleServer>,
     ) -> Result<ServerResult, ErrorData> {
-        let peer = self.peer().await?;
+        if let Some(parts) = context.extensions.get::<http::request::Parts>() {
+            let mut forwarded = HeaderMap::new();
+            for (name, value) in &parts.headers {
+                if name.as_str().starts_with("mcp-param-") {
+                    forwarded.insert(name.clone(), value.clone());
+                }
+            }
+            request.extensions_mut().insert(forwarded);
+        }
+        let (peer, bridge) = self.upstream_for(&context).await?;
+        let _request_guard = bridge.request_guard().await;
         let started = Instant::now();
         let handle = peer
             .send_cancellable_request(
@@ -81,19 +184,21 @@ impl SessionProxy {
             .map_err(service_error)?;
         let id = handle.id.clone();
         let progress_token = handle.progress_token.clone();
-        self.bridge
+        bridge.bind_request(id.clone(), context.peer.clone()).await;
+        bridge
             .bind_upstream_progress(progress_token.clone(), context.meta.get_progress_token())
             .await;
         let result = tokio::select! {
             result = handle.await_response() => result.map_err(service_error),
             _ = context.ct.cancelled() => {
                 let _ = peer.notify_cancelled(CancelledNotificationParam::new(
-                    Some(id), Some("originating downstream request cancelled".to_owned())
+                    Some(id.clone()), Some("originating downstream request cancelled".to_owned())
                 )).await;
                 Err(ErrorData::internal_error("request cancelled", None))
             }
         };
-        self.bridge.unbind_upstream_progress(&progress_token).await;
+        bridge.unbind_request(&id).await;
+        bridge.unbind_upstream_progress(&progress_token).await;
         self.runtime
             .record_call(&self.id, started.elapsed().as_millis() as u64)
             .await;
@@ -118,7 +223,7 @@ impl ServerHandler for SessionProxy {
         Cow::Owned(
             ProtocolVersion::KNOWN_VERSIONS
                 .iter()
-                .filter(|version| **version <= ProtocolVersion::LATEST)
+                .filter(|version| **version <= ProtocolVersion::V_2026_07_28)
                 .cloned()
                 .collect(),
         )
@@ -129,6 +234,13 @@ impl ServerHandler for SessionProxy {
             .read()
             .expect("server info lock poisoned")
             .clone()
+            .or_else(|| {
+                self.shared
+                    .info
+                    .read()
+                    .expect("server info lock poisoned")
+                    .clone()
+            })
             .unwrap_or_else(|| {
                 ServerInfo::new(ServerCapabilities::default())
                     .with_server_info(Implementation::new("mcplex", env!("CARGO_PKG_VERSION")))
@@ -137,9 +249,17 @@ impl ServerHandler for SessionProxy {
 
     async fn initialize(
         &self,
-        request: InitializeRequestParams,
+        mut request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, ErrorData> {
+        let downstream_version = if request.protocol_version < ProtocolVersion::V_2026_07_28
+            && ProtocolVersion::KNOWN_VERSIONS.contains(&request.protocol_version)
+        {
+            request.protocol_version.clone()
+        } else {
+            ProtocolVersion::LATEST
+        };
+        request.protocol_version = downstream_version.clone();
         context.peer.set_peer_info(request.clone());
         if !self.server.enabled {
             return Err(ErrorData::invalid_request(
@@ -152,13 +272,14 @@ impl ServerHandler for SessionProxy {
             .connect_session(
                 &self.id,
                 &self.server,
-                context.peer.clone(),
+                Some(context.peer.clone()),
                 request,
                 self.bridge.clone(),
             )
             .await
             .map_err(internal)?;
-        let info = session.info.clone();
+        let mut info = session.info.clone();
+        info.protocol_version = downstream_version;
         *self.upstream.lock().await = Some(session);
         *self.info.write().expect("server info lock poisoned") = Some(info.clone());
         Ok(info)
@@ -168,16 +289,18 @@ impl ServerHandler for SessionProxy {
         &self,
         context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, ErrorData> {
-        match self
-            .forward(
-                ClientRequest::DiscoverRequest(DiscoverRequest::new(DiscoverRequestParams {})),
-                context,
-            )
-            .await?
-        {
-            ServerResult::DiscoverResult(result) => Ok(result),
-            _ => Err(unexpected()),
-        }
+        self.ensure_shared(&context).await?;
+        let info = self
+            .shared
+            .info
+            .read()
+            .expect("server info lock poisoned")
+            .clone()
+            .expect("shared upstream info initialized");
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            info,
+        ))
     }
 
     fn accepted_subscription_filter(
@@ -188,7 +311,22 @@ impl ServerHandler for SessionProxy {
     }
 
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
-        let peer = self.peer().await?;
+        let serialize_requests = matches!(
+            &self.server.transport,
+            crate::config::TransportConfig::Stdio { .. }
+        );
+        let session = self
+            .runtime
+            .connect_session(
+                &self.id,
+                &self.server,
+                None,
+                Self::client_info(context.request_context())?,
+                Arc::new(BridgeState::new(serialize_requests)),
+            )
+            .await
+            .map_err(internal)?;
+        let peer = session.peer.clone();
         let mut subscription = peer
             .listen(context.accepted().clone())
             .await
@@ -495,7 +633,7 @@ impl ServerHandler for SessionProxy {
     }
 
     async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
-        if let Ok(peer) = self.peer().await {
+        if let Ok(peer) = self.legacy_peer().await {
             let mut notification = ClientNotification::RootsListChangedNotification(
                 RootsListChangedNotification::default(),
             );
@@ -510,7 +648,7 @@ impl ServerHandler for SessionProxy {
         context: NotificationContext<RoleServer>,
     ) {
         if let Some(notification) = self.bridge.forward_upstream_progress(notification).await
-            && let Ok(peer) = self.peer().await
+            && let Ok(peer) = self.legacy_peer().await
         {
             let mut notification =
                 ClientNotification::ProgressNotification(ProgressNotification::new(notification));
@@ -538,7 +676,7 @@ impl ServerHandler for SessionProxy {
         notification: CustomNotification,
         context: NotificationContext<RoleServer>,
     ) {
-        if let Ok(peer) = self.peer().await {
+        if let Ok(peer) = self.legacy_peer().await {
             let mut notification = ClientNotification::CustomNotification(notification);
             notification.extensions_mut().insert(context.meta);
             let _ = peer.send_notification(notification).await;
@@ -548,20 +686,79 @@ impl ServerHandler for SessionProxy {
 
 type McpRouters = Arc<RwLock<HashMap<String, (ServerConfig, Router)>>>;
 
+fn needs_modern_capability_prewarm(headers: &HeaderMap) -> bool {
+    let modern = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|version| version == ProtocolVersion::V_2026_07_28.as_str());
+    let capability_dependent = headers
+        .get("mcp-method")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|method| {
+            matches!(
+                method,
+                "subscriptions/listen" | "tasks/get" | "tasks/update" | "tasks/cancel"
+            )
+        });
+    modern && capability_dependent
+}
+
+fn gateway_client_info() -> ClientInfo {
+    ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::new("mcplex", env!("CARGO_PKG_VERSION")),
+    )
+    .with_protocol_version(ProtocolVersion::V_2026_07_28)
+}
+
 fn mcp_router(runtime: Arc<Runtime>, id: String, server: ServerConfig) -> Router {
     let id: Arc<str> = id.into();
+    let serialize_requests = matches!(
+        server.transport,
+        crate::config::TransportConfig::Stdio { .. }
+    );
+    let shared = Arc::new(SharedUpstream {
+        upstream: Mutex::new(None),
+        info: StdRwLock::new(None),
+        bridge: Arc::new(BridgeState::new(serialize_requests)),
+    });
+    let service_runtime = runtime.clone();
+    let service_id = id.clone();
+    let service_server = server.clone();
+    let service_shared = shared.clone();
     let service = StreamableHttpService::new(
         move || {
             Ok(SessionProxy::new(
-                runtime.clone(),
-                id.clone(),
-                server.clone(),
+                service_runtime.clone(),
+                service_id.clone(),
+                service_server.clone(),
+                service_shared.clone(),
             ))
         },
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_json_response(true),
+        StreamableHttpServerConfig::default(),
     );
-    Router::new().route_service("/", service)
+    Router::new()
+        .route_service("/", service)
+        .layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| {
+                let runtime = runtime.clone();
+                let id = id.clone();
+                let server = server.clone();
+                let shared = shared.clone();
+                async move {
+                    if needs_modern_capability_prewarm(request.headers())
+                        && shared
+                            .connect(&runtime, &id, &server, gateway_client_info())
+                            .await
+                            .is_err()
+                    {
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    next.run(request).await
+                }
+            },
+        ))
 }
 
 async fn sync_mcp_routers(registry: &McpRouters, runtime: &Arc<Runtime>, restart: Option<&str>) {
@@ -599,6 +796,9 @@ async fn dedicated_mcp(
     AxumPath(server): AxumPath<String>,
     mut request: Request<Body>,
 ) -> impl IntoResponse {
+    if request.headers().contains_key(http::header::ORIGIN) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let router = api
         .mcp_routers
         .read()
@@ -874,7 +1074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn future_protocol_is_not_advertised() {
+    async fn protocol_2026_07_28_is_advertised() {
         let proxy = SessionProxy::new(
             Runtime::new(Config::default()).await,
             "unused".into(),
@@ -887,9 +1087,14 @@ mod tests {
                 enabled: true,
                 tags: Vec::new(),
             },
+            Arc::new(SharedUpstream {
+                upstream: Mutex::new(None),
+                info: StdRwLock::new(None),
+                bridge: Arc::new(BridgeState::new(true)),
+            }),
         );
         let versions = proxy.supported_protocol_versions();
         assert!(versions.contains(&ProtocolVersion::LATEST));
-        assert!(!versions.contains(&ProtocolVersion::V_2026_07_28));
+        assert!(versions.contains(&ProtocolVersion::V_2026_07_28));
     }
 }

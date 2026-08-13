@@ -22,11 +22,15 @@ its own `GITHUB_TOKEN` with `contents: write` to update `Formula/mcplex.rb`.
 ## Flow
 
 1. Conventional commits land on `master`.
-2. release-plz opens or updates a `release-plz/` release PR.
-3. Merge the release PR with the generated `chore: release vX.Y.Z` subject.
-4. release-plz publishes the crate and creates `vX.Y.Z` with the GitHub App token.
-5. cargo-dist builds Linux and macOS archives and creates the GitHub Release.
-6. The successful release dispatches `update-mcplex` to homebrew-tap, which
+2. If `Cargo.toml` references an unpublished `mcplex-rmcp` version, publish that
+   compatibility crate first with
+   `cargo publish --manifest-path vendor/rmcp/Cargo.toml`. This is a separate,
+   irreversible crates.io publication and requires maintainer approval.
+3. release-plz opens or updates a `release-plz/` release PR.
+4. Merge the release PR with the generated `chore: release vX.Y.Z` subject.
+5. release-plz publishes the crate and creates `vX.Y.Z` with the GitHub App token.
+6. cargo-dist builds Linux and macOS archives and creates the GitHub Release.
+7. The successful release dispatches `update-mcplex` to homebrew-tap, which
    downloads the published archives, verifies they exist, computes their hashes,
    and updates the formula.
 
@@ -36,8 +40,10 @@ to its release commit. If crates.io publication succeeds but tag creation fails,
 first verify that the exact version exists on crates.io, then recover the missing
 tag by manually running the Release PR workflow with `release_tag` set to the
 missing `vX.Y.Z`. The recovery validates the exact release line, version, and
-merged `master` ancestry before using the GitHub App token, so cargo-dist is
-triggered from the original release commit.
+merged `master` ancestry before using the GitHub App token. When the exact crate
+version is already published, it switches release-plz to git-only mode so the tag
+is created without attempting another crates.io upload and cargo-dist is triggered
+from the original release commit.
 
 If a tag exists but cargo-dist cannot complete because its original runner image
 was retired, first update `github-custom-runners` and the Release workflow on

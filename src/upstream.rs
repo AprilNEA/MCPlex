@@ -11,9 +11,11 @@ use std::{
 use anyhow::{Context, Result};
 use http::{HeaderName, HeaderValue};
 use rmcp::{
-    ClientHandler, Peer, RoleClient, RoleServer, ServiceExt,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt, Peer, RoleClient, RoleServer,
     model::*,
-    service::{NotificationContext, PeerRequestOptions, RequestContext, ServiceError},
+    service::{
+        InboundStreamOrigin, NotificationContext, PeerRequestOptions, RequestContext, ServiceError,
+    },
     transport::{
         ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess, auth::AuthClient,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -22,7 +24,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     process::Command,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, MutexGuard, Notify, RwLock},
     task::JoinHandle,
 };
 
@@ -85,13 +87,108 @@ pub struct UpstreamSession {
     waiter: JoinHandle<()>,
 }
 
-#[derive(Default)]
 pub struct BridgeState {
     upstream_to_downstream_progress: RwLock<HashMap<ProgressToken, ProgressToken>>,
     downstream_to_upstream_progress: RwLock<HashMap<ProgressToken, ProgressToken>>,
+    request_routes: RwLock<HashMap<RequestId, Peer<RoleServer>>>,
+    request_routes_changed: Notify,
+    serialize_requests: bool,
+    request_gate: Mutex<()>,
 }
 
 impl BridgeState {
+    pub fn new(serialize_requests: bool) -> Self {
+        Self {
+            upstream_to_downstream_progress: RwLock::new(HashMap::new()),
+            downstream_to_upstream_progress: RwLock::new(HashMap::new()),
+            request_routes: RwLock::new(HashMap::new()),
+            request_routes_changed: Notify::new(),
+            serialize_requests,
+            request_gate: Mutex::new(()),
+        }
+    }
+
+    pub async fn request_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        if self.serialize_requests {
+            Some(self.request_gate.lock().await)
+        } else {
+            None
+        }
+    }
+
+    pub async fn bind_request(&self, upstream: RequestId, downstream: Peer<RoleServer>) {
+        self.request_routes
+            .write()
+            .await
+            .insert(upstream, downstream);
+        self.request_routes_changed.notify_waiters();
+    }
+
+    pub async fn unbind_request(&self, upstream: &RequestId) {
+        self.request_routes.write().await.remove(upstream);
+        self.request_routes_changed.notify_waiters();
+    }
+
+    async fn downstream_for(
+        &self,
+        context: &RequestContext<RoleClient>,
+    ) -> Result<Peer<RoleServer>, ErrorData> {
+        let origin = context.extensions.get::<InboundStreamOrigin>().cloned();
+        self.downstream_for_origin(origin, context.ct.clone()).await
+    }
+
+    async fn downstream_for_notification(
+        &self,
+        context: &NotificationContext<RoleClient>,
+    ) -> Option<Peer<RoleServer>> {
+        let origin = context.extensions.get::<InboundStreamOrigin>().cloned();
+        self.downstream_for_origin(origin, tokio_util::sync::CancellationToken::new())
+            .await
+            .ok()
+    }
+
+    async fn downstream_for_origin(
+        &self,
+        origin: Option<InboundStreamOrigin>,
+        cancelled: tokio_util::sync::CancellationToken,
+    ) -> Result<Peer<RoleServer>, ErrorData> {
+        let route = async {
+            loop {
+                let changed = self.request_routes_changed.notified();
+                let routes = self.request_routes.read().await;
+                let route = match &origin {
+                    Some(InboundStreamOrigin::OutboundRequest(id)) => routes.get(id).cloned(),
+                    Some(InboundStreamOrigin::Unassociated) | None if routes.len() == 1 => {
+                        routes.values().next().cloned()
+                    }
+                    Some(InboundStreamOrigin::Unassociated) | None if routes.len() > 1 => {
+                        return Err(ErrorData::invalid_request(
+                            "upstream reverse request is not associated with a unique downstream request",
+                            None,
+                        ));
+                    }
+                    _ => None,
+                };
+                drop(routes);
+                if let Some(route) = route {
+                    return Ok(route);
+                }
+                changed.await;
+            }
+        };
+        tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(1), route) => result
+                .map_err(|_| ErrorData::invalid_request(
+                    "upstream reverse request has no active downstream request association",
+                    None,
+                ))?,
+            _ = cancelled.cancelled() => Err(ErrorData::invalid_request(
+                "upstream reverse request was cancelled before association",
+                None,
+            )),
+        }
+    }
+
     pub async fn bind_upstream_progress(
         &self,
         upstream: ProgressToken,
@@ -161,6 +258,12 @@ impl BridgeState {
     }
 }
 
+impl Default for BridgeState {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
 impl Drop for UpstreamSession {
     fn drop(&mut self) {
         if let Some(token) = self.service_cancel.take() {
@@ -172,7 +275,7 @@ impl Drop for UpstreamSession {
 
 #[derive(Clone)]
 pub struct BridgeClientHandler {
-    pub downstream: Peer<RoleServer>,
+    pub fallback_downstream: Option<Peer<RoleServer>>,
     pub client_info: ClientInfo,
     pub bridge: Arc<BridgeState>,
 }
@@ -350,8 +453,15 @@ impl BridgeClientHandler {
         mut notification: ServerNotification,
         context: NotificationContext<RoleClient>,
     ) {
+        let downstream = if let Some(downstream) = &self.fallback_downstream {
+            Some(downstream.clone())
+        } else {
+            self.bridge.downstream_for_notification(&context).await
+        };
         notification.extensions_mut().insert(context.meta);
-        let _ = self.downstream.send_notification(notification).await;
+        if let Some(downstream) = downstream {
+            let _ = downstream.send_notification(notification).await;
+        }
     }
 
     async fn forward_reverse(
@@ -359,8 +469,18 @@ impl BridgeClientHandler {
         request: ServerRequest,
         context: RequestContext<RoleClient>,
     ) -> Result<ClientResult, ErrorData> {
-        let handle = self
-            .downstream
+        if self.client_info.protocol_version >= ProtocolVersion::V_2026_07_28 {
+            return Err(ErrorData::invalid_request(
+                "MCP 2026-07-28 server-to-client requests must use an InputRequiredResult (MRTR)",
+                None,
+            ));
+        }
+        let downstream = if let Some(downstream) = &self.fallback_downstream {
+            downstream.clone()
+        } else {
+            self.bridge.downstream_for(&context).await?
+        };
+        let handle = downstream
             .send_cancellable_request(
                 request,
                 PeerRequestOptions::no_options().with_meta(context.meta.clone()),
@@ -375,7 +495,7 @@ impl BridgeClientHandler {
         let result = tokio::select! {
             result = handle.await_response() => result.map_err(service_error),
             _ = context.ct.cancelled() => {
-                let _ = self.downstream.notify_cancelled(CancelledNotificationParam::new(
+                let _ = downstream.notify_cancelled(CancelledNotificationParam::new(
                     Some(id), Some("originating upstream request cancelled".to_owned())
                 )).await;
                 Err(ErrorData::internal_error("request cancelled", None))
@@ -525,12 +645,12 @@ impl Runtime {
         self: &Arc<Self>,
         id: &str,
         server: &ServerConfig,
-        downstream: Peer<RoleServer>,
+        fallback_downstream: Option<Peer<RoleServer>>,
         client_info: ClientInfo,
         bridge: Arc<BridgeState>,
     ) -> Result<UpstreamSession> {
         let result = self
-            .connect_session_inner(id, server, downstream, client_info, bridge)
+            .connect_session_inner(id, server, fallback_downstream, client_info, bridge)
             .await;
         if let Err(error) = &result {
             let error = redact(&format!("{error:#}"));
@@ -545,7 +665,7 @@ impl Runtime {
         self: &Arc<Self>,
         id: &str,
         server: &ServerConfig,
-        downstream: Peer<RoleServer>,
+        fallback_downstream: Option<Peer<RoleServer>>,
         client_info: ClientInfo,
         bridge: Arc<BridgeState>,
     ) -> Result<UpstreamSession> {
@@ -554,8 +674,15 @@ impl Runtime {
         }
         self.set_connection_state(id, State::Starting, None).await;
         self.log(format!("{id}: connecting session")).await;
+        let lifecycle = if fallback_downstream.is_some() {
+            ClientLifecycleMode::Initialize
+        } else {
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            }
+        };
         let handler = BridgeClientHandler {
-            downstream,
+            fallback_downstream,
             client_info,
             bridge,
         };
@@ -571,9 +698,12 @@ impl Runtime {
                 let transport = TokioChildProcess::new(Command::new(command).configure(|c| {
                     c.args(args).envs(resolved).stderr(Stdio::inherit());
                 }))?;
-                tokio::time::timeout(Duration::from_secs(10), handler.serve(transport))
-                    .await
-                    .context("upstream connection timed out")??
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    handler.serve_with_lifecycle(transport, lifecycle),
+                )
+                .await
+                .context("upstream connection timed out")??
             }
             TransportConfig::Http {
                 url,
@@ -597,14 +727,20 @@ impl Runtime {
                     let client = AuthClient::new(reqwest::Client::new(), manager);
                     tokio::time::timeout(
                         Duration::from_secs(10),
-                        handler.serve(StreamableHttpClientTransport::with_client(client, cfg)),
+                        handler.serve_with_lifecycle(
+                            StreamableHttpClientTransport::with_client(client, cfg),
+                            lifecycle,
+                        ),
                     )
                     .await
                     .context("upstream connection timed out")??
                 } else {
                     tokio::time::timeout(
                         Duration::from_secs(10),
-                        handler.serve(StreamableHttpClientTransport::from_config(cfg)),
+                        handler.serve_with_lifecycle(
+                            StreamableHttpClientTransport::from_config(cfg),
+                            lifecycle,
+                        ),
                     )
                     .await
                     .context("upstream connection timed out")??
@@ -621,7 +757,7 @@ impl Runtime {
                 negotiated
                     .server_info
                     .clone()
-                    .context("upstream supplied no implementation info")?,
+                    .unwrap_or_else(|| Implementation::new("upstream", "unknown")),
             );
         info.instructions = negotiated.instructions.clone();
         info.meta = negotiated.meta.clone();
