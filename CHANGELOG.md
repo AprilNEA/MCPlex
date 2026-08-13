@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- add a dedicated `mcplex-daemon` executable for user services
+
+### Changed
+
+- sign and notarize macOS release binaries with stable CLI and daemon identifiers
+
 ## [0.5.0] - 2026-08-13
 
 ### Added

@@ -1,6 +1,8 @@
 # Optional user services
 
 Nothing is installed automatically. Edit executable paths and token handling first.
+Release archives and `cargo install` include the dedicated `mcplex-daemon` executable;
+`mcplex serve --foreground` remains available for interactive use.
 
 Linux: copy `docs/mcplex.service` to `~/.config/systemd/user/`, then run `systemctl --user daemon-reload &&
 systemctl --user enable --now mcplex`. Inspect with `journalctl --user -u mcplex`.

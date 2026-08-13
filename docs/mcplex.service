@@ -3,7 +3,7 @@ Description=mcplex local MCP gateway
 After=network-online.target
 
 [Service]
-ExecStart=%h/.cargo/bin/mcplex serve --foreground
+ExecStart=%h/.cargo/bin/mcplex-daemon --foreground
 Restart=on-failure
 
 [Install]

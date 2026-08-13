@@ -13,6 +13,10 @@ Configure these GitHub Actions repository secrets:
 - `OP_GITHUB_APP_ITEM`: a 1Password item reference containing
   `GITHUB_APP_ID`, base64-encoded `GITHUB_APP_PRIVATE_KEY`, and
   `CARGO_REGISTRY_TOKEN` fields.
+- `OP_APPLE_SECRET_ITEM`: the same Apple release item used by OpenLogi,
+  containing `APPLE_SIGNING_IDENTITY`, base64-encoded `APPLE_CERTIFICATE`,
+  `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, and
+  `APPLE_TEAM_ID` fields.
 
 The GitHub App must be installed on both `AprilNEA/MCPlex` and
 `AprilNEA/homebrew-tap`. It needs repository contents and pull-request write
@@ -29,8 +33,17 @@ its own `GITHUB_TOKEN` with `contents: write` to update `Formula/mcplex.rb`.
 3. release-plz opens or updates a `release-plz/` release PR.
 4. Merge the release PR with the generated `chore: release vX.Y.Z` subject.
 5. release-plz publishes the crate and creates `vX.Y.Z` with the GitHub App token.
-6. cargo-dist builds Linux and macOS archives and creates the GitHub Release.
-7. The successful release dispatches `update-mcplex` to homebrew-tap, which
+6. cargo-dist builds Linux and macOS archives. The release workflow signs the
+   macOS `mcplex` and `mcplex-daemon` executables as
+   `com.aprilnea.mcplex.cli` and `com.aprilnea.mcplex.daemon`, respectively,
+   then submits each architecture to Apple's notary service before repackaging.
+   These are explicit identifiers on the bare Mach-O signatures; the
+   `com.aprilnea.mcplex` root remains available for a future native app bundle.
+   Bare executables cannot carry a stapled ticket, so `notarytool submit --wait`
+   is the release gate and Apple's online ticket is associated with the signed
+   code hash.
+7. cargo-dist creates the GitHub Release.
+8. The successful release dispatches `update-mcplex` to homebrew-tap, which
    downloads the published archives, verifies they exist, computes their hashes,
    and updates the formula.
 

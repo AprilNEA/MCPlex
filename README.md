@@ -17,7 +17,8 @@ read Claude-style stdio entries; HTTP servers can be added with `mcplex add`.
 
 ## Commands
 
-- `serve`, `status`, `doctor`, `reload`, and `tui` operate the daemon.
+- `serve`, `status`, `doctor`, `reload`, and `tui` operate the daemon. Release
+  archives also include `mcplex-daemon` as the dedicated service executable.
 - `ls` lists configured servers; `ls --tools --server ID` queries one dedicated
   endpoint; `logs [-f] [--server ID]` reads logs.
 - `import [PATH]` imports stdio entries; `snippet CLIENT --server ID` prints client

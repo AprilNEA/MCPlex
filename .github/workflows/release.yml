@@ -179,11 +179,62 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      - name: Load Apple release secrets from 1Password
+        id: apple-secrets
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'apple-darwin') }}
+        uses: 1password/load-secrets-action@v4
+        with:
+          export-env: false
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.OP_APPLE_SECRET_ITEM }}/APPLE_SIGNING_IDENTITY
+          APPLE_CERTIFICATE: ${{ secrets.OP_APPLE_SECRET_ITEM }}/APPLE_CERTIFICATE
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.OP_APPLE_SECRET_ITEM }}/APPLE_CERTIFICATE_PASSWORD
+          APPLE_ID: ${{ secrets.OP_APPLE_SECRET_ITEM }}/APPLE_ID
+          APPLE_PASSWORD: ${{ secrets.OP_APPLE_SECRET_ITEM }}/APPLE_PASSWORD
+          APPLE_TEAM_ID: ${{ secrets.OP_APPLE_SECRET_ITEM }}/APPLE_TEAM_ID
+      - name: Validate Apple release secrets
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'apple-darwin') }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.apple-secrets.outputs.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ steps.apple-secrets.outputs.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ steps.apple-secrets.outputs.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ steps.apple-secrets.outputs.APPLE_ID }}
+          APPLE_PASSWORD: ${{ steps.apple-secrets.outputs.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ steps.apple-secrets.outputs.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          : "${APPLE_SIGNING_IDENTITY:?Configure APPLE_SIGNING_IDENTITY in 1Password}"
+          : "${APPLE_CERTIFICATE:?Configure APPLE_CERTIFICATE in 1Password}"
+          : "${APPLE_CERTIFICATE_PASSWORD:?Configure APPLE_CERTIFICATE_PASSWORD in 1Password}"
+          : "${APPLE_ID:?Configure APPLE_ID in 1Password}"
+          : "${APPLE_PASSWORD:?Configure APPLE_PASSWORD in 1Password}"
+          : "${APPLE_TEAM_ID:?Configure APPLE_TEAM_ID in 1Password}"
+      - name: Import Apple signing certificate
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'apple-darwin') }}
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ steps.apple-secrets.outputs.APPLE_CERTIFICATE }}
+          p12-password: ${{ steps.apple-secrets.outputs.APPLE_CERTIFICATE_PASSWORD }}
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Sign and notarize macOS executables
+        if: ${{ needs.plan.outputs.publishing == 'true' && contains(join(matrix.targets, ','), 'apple-darwin') }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.apple-secrets.outputs.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ steps.apple-secrets.outputs.APPLE_ID }}
+          APPLE_PASSWORD: ${{ steps.apple-secrets.outputs.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ steps.apple-secrets.outputs.APPLE_TEAM_ID }}
+          DIST_TARGETS: ${{ join(matrix.targets, ' ') }}
+        run: |
+          for target in $DIST_TARGETS; do
+            case "$target" in
+              *-apple-darwin) bash .github/scripts/sign-notarize-macos.sh "$target" ;;
+            esac
+          done
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

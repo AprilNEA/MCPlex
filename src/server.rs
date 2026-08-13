@@ -30,7 +30,7 @@ use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
 use crate::{
-    config::{Config, ServerConfig},
+    config::{Config, ServerConfig, default_path},
     secrets,
     upstream::{BridgeState, Runtime, RuntimeChange, UpstreamSession},
 };
@@ -926,6 +926,17 @@ async fn mutate(
         Ok(()) => Json(json!({"ok":true})).into_response(),
         Err(e) => (StatusCode::CONFLICT, Json(json!({"error":e.to_string()}))).into_response(),
     }
+}
+
+pub async fn serve_path(path: Option<PathBuf>) -> Result<()> {
+    let path = path.map_or_else(default_path, Ok)?;
+    let config = if path.exists() {
+        Config::load(&path)?
+    } else {
+        tracing::info!(path = %path.display(), "config not found; using defaults");
+        Config::default()
+    };
+    serve(config, path).await
 }
 
 pub async fn serve(config: Config, path: PathBuf) -> Result<()> {

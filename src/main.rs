@@ -141,16 +141,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { .. } => {
-            let path = cli.config.map_or_else(default_path, Ok)?;
-            let config = if path.exists() {
-                Config::load(&path)?
-            } else {
-                tracing::info!(path = %path.display(), "config not found; using defaults");
-                Config::default()
-            };
-            mcplex::server::serve(config, path).await
-        }
+        Command::Serve { .. } => mcplex::server::serve_path(cli.config).await,
         Command::Import { path } => import_config(path, cli.config).map(|count| {
             eprintln!("imported {count} MCP server(s)");
         }),
