@@ -108,8 +108,8 @@ select, `e` enables/disables, `r` restarts, `R` reloads, `f` filters logs, `?` s
 and `q`/Escape quits.
 
 Explicit v0 non-goals are multi-user service, non-loopback binding, and TLS termination.
-See [protocol support](docs/protocol-support.md), [security](SECURITY.md), and optional
-[user-service samples](docs/services.md).
+See [protocol support](docs/protocol-support.md), [security](SECURITY.md), and
+[user-service setup](docs/services.md).
 
 ## Development and release
 
